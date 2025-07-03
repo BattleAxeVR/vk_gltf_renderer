@@ -156,6 +156,31 @@ if(USE_DLSS)
 endif()
 
 #####################################################################################
+
+# Adding OpenXR if selected
+option(USE_OPENXR "Use OpenXR for VR" ON)
+
+if(USE_OPENXR)
+  message(STATUS "Use OpenXR for VR")
+  #include(cmake/openxr.cmake)
+  #download_openxr()
+  
+  #target_include_directories(${PROJECT_NAME} PRIVATE ${openxr_SOURCE_DIR}/src ${openxr_BINARY_DIR})
+  #target_link_libraries(${PROJECT_NAME} PRIVATE openxr::openxr)
+  #target_link_libraries(${PROJECT_NAME} PRIVATE openxr)
+  
+  target_compile_definitions(${PROJECT_NAME} PRIVATE USE_OPENXR)
+	
+  list(APPEND SOURCE_FILES 
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/BVR_OpenXR.cpp 
+		${CMAKE_CURRENT_SOURCE_DIR}/src/BVR_OpenXR.h
+		${CMAKE_CURRENT_SOURCE_DIR}/src/BVR_defines.h
+        )
+    target_sources(${PROJECT_NAME} PRIVATE ${SOURCE_FILES})
+endif()
+
+#####################################################################################
+
 # Adding download resources
 # download_files(FILENAMES FlightHelmet.zip EXTRACT)
 download_files(FILENAMES daytime.hdr std_env.hdr)
