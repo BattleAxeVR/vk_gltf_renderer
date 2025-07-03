@@ -108,7 +108,7 @@ target_sources(${PROJECT_NAME} PRIVATE ${MIKKTSPACE_SRC})
 source_group("MikkTSpace" FILES ${MIKKTSPACE_SRC})
 #####################################################################################
 # Adding DLSS if selected
-option(USE_DLSS "Use DLSS-RR for denoising" OFF)
+option(USE_DLSS "Use DLSS-RR for denoising" ON)
 if(USE_DLSS)
   message(STATUS "Using DLSS-RR for denoising")
     download_package(
