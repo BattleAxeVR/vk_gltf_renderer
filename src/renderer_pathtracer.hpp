@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,26 +13,36 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #pragma once
 
+#include <mutex>
+#include <thread>
+
 #include <glm/glm.hpp>
 
 // Shader Input/Output
-namespace shaderio {
-using namespace glm;
 #include "shaders/shaderio.h"  // Shared between host and device
-}  // namespace shaderio
 
 #include <nvvk/sbt_generator.hpp>
+#include <nvutils/profiler.hpp>
 #include "renderer_base.hpp"
+#include "utils.hpp"
+#include "pipeline_cache_util.hpp"
+#include "scene_feature_detection.hpp"
+#include "ui_busy_window.hpp"
 
 // #DLSS
 #if defined(USE_DLSS)
-#include "dlss_denoiser.hpp"
+#include "dlss.hpp"
+#endif
+
+// #OPTIX
+#if defined(USE_OPTIX_DENOISER)
+#include "optix_denoiser.hpp"
 #endif
 
 
@@ -44,34 +54,43 @@ public:
 
   enum class RenderTechnique
   {
-    Compute,
+    RayQuery,
     RayTracing
   };
 
   void onAttach(Resources& resources, nvvk::ProfilerGpuTimer* profiler) override;
+  void setProfilerTimeline(nvutils::ProfilerTimeline* timeline) { m_profilerTimeline = timeline; }
   void onDetach(Resources& resources) override;
   void onResize(VkCommandBuffer cmd, const VkExtent2D& size, Resources& resources) override;
   bool onUIRender(Resources& resources) override;
   void onRender(VkCommandBuffer cmd, Resources& resources) override;
-  void onUIMenu() override;
+  void onSceneInvalidated(Resources& resources) override;
+  void notifyDlssContentReset(Resources& resources) override;
 
   void updateDlssResources(VkCommandBuffer cmd, Resources& resources);
+  void updateOptiXResources(VkCommandBuffer cmd, Resources& resources);
   void pushDescriptorSet(VkCommandBuffer cmd, Resources& resources, VkPipelineBindPoint bindPoint) const;
   void createPipeline(Resources& resources) override;
+  void createRqPipeline(Resources& resources);
   void createRtxPipeline(Resources& resources);
   void compileShader(Resources& resources, bool fromFile = true) override;
+  // User-initiated hot reload: drop cached variants and recompile from Slang source.
+  void reloadShader(Resources& resources);
+  void setBusyWindow(BusyWindow* busy) { m_busyWindow = busy; }
 
   // Register command line parameters
   void registerParameters(nvutils::ParameterRegistry* paramReg);
+  void setSettingsHandler(nvgui::SettingsHandler* settingsHandler);
 
   VkDevice                        m_device{};  // Vulkan device
   VkPipelineLayout                m_pipelineLayout{};
-  VkPipeline                      m_pipeline{};   // Ray tracing pipeline
-  shaderio::PathtracePushConstant m_pushConst{};  // Information sent to the shader
-  VkShaderEXT                     m_shader{};
-  float                           m_sceneRadius{1.0f};
+  VkPipeline                      m_rtxPipeline{};    // Ray tracing pipeline
+  VkPipeline                      m_rqPipeline{};     // Ray tracing pipeline
+  shaderio::PathtracePushConstant m_pushConst{};      // Information sent to the shader
   bool                            m_autoFocus{true};  // Enable auto-focus
   VkShaderModule                  m_shaderModule{};   // Shader module for RTX
+
+  nvvk::PipelineCacheManager m_pipelineCache{};  // Pipeline cache for faster creation
 
   // Shader Binding Table (SBT)
   nvvk::Buffer                m_sbtBuffer{};   // Buffer for the Shader Binding Table
@@ -82,10 +101,159 @@ public:
   VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV m_reorderProperties{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_NV};
 
-  RenderTechnique m_renderTechnique{RenderTechnique::Compute};
+  bool m_supportSER{false};         // True when the device supports SER (Shader Execution Reordering).
+  bool m_useSER{true};              // Requested SER state; clamped to m_supportSER each frame.
+  bool m_pipelineUseSER{false};     // SER value the currently-live pipelines were built with.
+  bool m_compiledWireframe{false};  // True when the shader is the wireframe build.
+  bool m_compiledVisualize{false};  // True when the shader has the debug-visualization code compiled in (USE_VISUALIZE).
+  bool m_compiledOptimal{false};    // True when the shader is the scene-aware optimized build.
+  bool m_compiledDlss{false};       // True when the current shader was compiled with DLSS active (USE_DLSS_SHADER).
+  bool m_compiledDlssGuide{false};  // True when the current shader has the guide-buffer variant compiled in (USE_GUIDE_SHADER).
+  nvvkgltf::SceneFeatureSet m_compiledFeatures{};  // The feature set the current shader was compiled against.
 
-  // #DLSS - Implementation of the DLSS denoiser
+  // Variant pipeline cache: avoids slow pipeline (re)compilation by reusing previously built
+  // VkShaderModule and pipelines for a given VariantKey. LRU-limited (see kVariantCacheMaxEntries).
+  struct VariantKey
+  {
+    bool wireframe = false;  // True when the shader is the wireframe build.
+    bool visualize = false;  // True when the debug-visualization code is compiled in (USE_VISUALIZE).
+    bool optimal   = false;  // True when the shader is the scene-aware optimized build.
+    bool dlss      = false;  // True when DLSS is active (drives USE_DLSS_SHADER: sample-loop gate).
+    bool dlssGuide = false;  // True when guide-buffer capture is compiled in (USE_GUIDE_SHADER: DLSS or OptiX).
+    nvvkgltf::SceneFeatureSet features{};  // only meaningful when `optimal == true`
+
+    bool operator==(const VariantKey& o) const
+    {
+      // dlss and dlssGuide are compared in every mode (they drive USE_DLSS_SHADER / USE_GUIDE_SHADER
+      // independently of optimal); the full extension feature set only matters for the optimal build.
+      return wireframe == o.wireframe && visualize == o.visualize && optimal == o.optimal && dlss == o.dlss
+             && dlssGuide == o.dlssGuide && (optimal ? (features == o.features) : true);
+    }
+  };
+
+  // Variant cache entry: stores a shader module, RTX/RQ pipelines, and SBT for a given VariantKey.
+  struct VariantCacheEntry
+  {
+    VariantKey                  key;
+    VkShaderModule              shaderModule = VK_NULL_HANDLE;
+    VkPipeline                  rtxPipeline  = VK_NULL_HANDLE;
+    VkPipeline                  rqPipeline   = VK_NULL_HANDLE;
+    bool                        useSER       = false;  // SER value the cached pipelines were built with.
+    nvvk::Buffer                sbtBuffer{};           // Buffer for the SBT (Shader Binding Table)
+    nvvk::SBTGenerator::Regions sbtRegions{};          // The SBT regions (raygen, miss, chit, ahit)
+  };
+  std::vector<VariantCacheEntry> m_variantCache;  // MRU front, LRU back
+  static constexpr size_t        kVariantCacheMaxEntries = 8;
+
+  // Saves active shader/pipeline/SBT to cache by VariantKey; switches to `newKey`.
+  // On hit, restores cached handles and returns true; on miss, clears handles for rebuild.
+  // LRU-evicted SBTs are freed via Resources.
+  bool swapVariant(Resources& resources, const VariantKey& newKey);
+  void destroyVariantCache(Resources& resources);
+
+  BusyWindow* m_busyWindow{nullptr};  // Modal shown during async shader/pipeline compile.
+  std::mutex  m_compileMutex;         // Guards compile metadata and live pipeline handles.
+  std::thread m_compileThread;        // Joined in onDetach().
+
+  // The default rendering technique
+  RenderTechnique m_renderTechnique{RenderTechnique::RayTracing};
+
+  // Adaptive sampling for performance optimization
+  void                       updateAdaptiveSampling(Resources& resources);
+  nvutils::ProfilerTimeline* m_profilerTimeline{nullptr};
+  bool                       m_adaptiveSampling{true};
+  int                        m_totalSamplesAccumulated{0};  // Track total samples separately
+
+  nvsamples::RollingAverage<float, 100> m_throughputRollingAvg;  // Rolling average of mega-sample-pixels per second (MSPP/s)
+
+  // Adaptive performance targets
+  enum class PerformanceTarget
+  {
+    eInteractive = 0,  // 60 FPS - for real-time interaction
+    eBalanced    = 1,  // 30 FPS - good balance of responsiveness and quality
+    eQuality     = 2,  // 15 FPS - prioritize quality convergence
+    eMaxQuality  = 3   // 10 FPS - maximum GPU utilization for fastest convergence
+  };
+
+  PerformanceTarget    m_performanceTarget{PerformanceTarget::eBalanced};  // Default to balanced for path tracing
+  static constexpr int MAX_SAMPLES_PER_PIXEL = 100;
+  static constexpr int MIN_SAMPLES_PER_PIXEL = 1;
+
+  double getTargetFrameTimeMs() const
+  {
+    switch(m_performanceTarget)
+    {
+      case PerformanceTarget::eInteractive:
+        return 1000.0 / 60.0;  // 16.67ms
+      case PerformanceTarget::eBalanced:
+        return 1000.0 / 30.0;  // 33.33ms
+      case PerformanceTarget::eQuality:
+        return 1000.0 / 15.0;  // 66.67ms
+      case PerformanceTarget::eMaxQuality:
+        return 1000.0 / 10.0;  // 100ms
+      default:
+        return 1000.0 / 30.0;
+    }
+  }
+
+  // True when the user has DLSS-RR enabled
+  bool isDlssEnabled() const
+  {
 #if defined(USE_DLSS)
-  std::unique_ptr<DlssDenoiser> m_dlss;
+    if(!m_dlss)
+      return false;
+    const auto s = m_dlss->state();
+    return s == Dlss::State::eLoading || s == Dlss::State::eActive;
+#else
+    return false;
 #endif
+  }
+
+  // #DLSS - Implementation of the DLSS denoiser (Ray Reconstruction).
+#if defined(USE_DLSS)
+  std::unique_ptr<Dlss> m_dlss;
+  Dlss*                 getDlss() { return m_dlss.get(); }
+  const Dlss*           getDlss() const { return m_dlss.get(); }
+#endif
+
+
+  // #OPTIX - Implementation of the OptiX denoiser
+#if defined(USE_OPTIX_DENOISER)
+  std::unique_ptr<OptiXDenoiser> m_optix;
+  OptiXDenoiser*                 getOptiXDenoiser() { return m_optix.get(); }
+  const OptiXDenoiser*           getOptiXDenoiser() const { return m_optix.get(); }
+#endif
+
+
+private:
+  struct CompileStateSnapshot
+  {
+    bool                      wireframe = false;
+    bool                      visualize = false;
+    bool                      optimal   = false;
+    bool                      dlss      = false;
+    bool                      dlssGuide = false;
+    nvvkgltf::SceneFeatureSet features{};
+    VkPipeline                rqPipeline  = VK_NULL_HANDLE;
+    VkPipeline                rtxPipeline = VK_NULL_HANDLE;
+  };
+
+  void                 ensureShadersAndPipelines(Resources& resources);
+  void                 startAsyncCompile(Resources& resources);
+  CompileStateSnapshot getCompileStateSnapshot();
+  void                 updateStatistics(Resources& resources);
+  void                 renderRayQuery(VkCommandBuffer cmd, VkExtent2D renderingSize, Resources& resources);
+  void                 renderRayTrace(VkCommandBuffer cmd, VkExtent2D& renderingSize, Resources& resources);
+  void                 denoiseDlss(VkCommandBuffer cmd, Resources& resources);
+  void                 setupPushConstant(VkCommandBuffer cmd, Resources& resources, VkExtent2D renderingSize);
+  // Determine if DLSS should actively denoise this frame
+  bool getEffectiveDlssEnabled(const Resources& resources) const;
+  // Determine if OptiX should actively denoise this frame
+  bool getEffectiveOptixEnabled(const Resources& resources) const;
+  // Upscale selection ID and depth from render resolution to display resolution (OptiX 2x mode)
+  void upscaleSelectionAndDepth(VkCommandBuffer cmd, Resources& resources);
+  // Destroy the pipelines for both Ray Query and Ray Tracing
+  void destroyPipelinesLocked();
+  void destroyPipelines();
+  bool m_skipVariantCache{false};  // Set during reloadShader(); bypasses swapVariant lookup.
 };

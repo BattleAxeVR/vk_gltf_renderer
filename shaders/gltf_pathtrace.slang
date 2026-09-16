@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,624 +13,344 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "nvshaders/functions.h.slang"
-#include "nvshaders/random.h.slang"
-#include "nvshaders/sky_functions.h.slang"
+#ifndef AVAILABLE_SER
+#define AVAILABLE_SER 1
+#endif
 
-#include "nvshaders/bsdf_types.h.slang"
-#include "nvshaders/bsdf_functions.h.slang"
-#include "nvshaders/gltf_scene_io.h.slang"
-#include "nvshaders/gltf_vertex_access.h.slang"
-#include "nvshaders/hdr_env_sampling.h.slang"
-#include "nvshaders/light_contrib.h.slang"
-#include "nvshaders/pbr_ggx_microfacet.h.slang"
-#include "nvshaders/pbr_material_eval.h.slang"
-#include "nvshaders/ray_utils.h.slang"
-#include "nvshaders/sample_blur.h.slang"
+#ifndef WIREFRAME
+#define WIREFRAME 0
+#endif
 
+// This is a debug flag to enable/disable debug output
+// For example, to use print statements in the shader, set this to true.
+// Add printf and enable the Validation layer debug output.
+static bool doDebug = false;
 
+#include "gltf_material_eval.h.slang"
+#include "gltf_scene_io.h.slang"
+#include "gltf_vertex_access.h.slang"
 #include "shaderio.h"
 #include "get_hit.h.slang"
 #include "dlss_util.h"
-
 #include "common.h.slang"
-#include "raytracer_interface.h.slang"
 
+// NVSHADERS are under: https://github.com/nvpro-samples/nvpro_core2/tree/main/nvshaders
+#include "nvshaders/functions.h.slang"
+#include "nvshaders/random.h.slang"
+#include "nvshaders/sky_functions.h.slang"
+#include "nvshaders/bsdf_types.h.slang"
+#include "nvshaders/bsdf_functions.h.slang"
+#include "nvshaders/hdr_env_sampling.h.slang"
+#include "nvshaders/light_contrib.h.slang"
+#include "nvshaders/normal_compress.h.slang"
+#include "nvshaders/pbr_ggx_microfacet.h.slang"
+#include "nvshaders/ray_utils.h.slang"
+#include "nvshaders/sample_blur.h.slang"
+#if WIREFRAME
+#include "nvshaders/wireframe.h.slang"
+#endif
+
+
+// clang-format off
 
 // Bindings
-// clang-format off
-[[vk::push_constant]]                               ConstantBuffer<PathtracePushConstant>   pushConst;
-[[vk::binding(BindingPoints::eTextures, 0)]]        Sampler2D                               allTextures[];
-[[vk::binding(BindingPoints::eTexturesHdr, 0)]]     Sampler2D                               texturesHdr[];
-[[vk::binding(BindingPoints::eTlas, 1)]]            RaytracingAccelerationStructure         topLevelAS;
-[[vk::binding(BindingPoints::eOutImages, 1)]]       RWTexture2D<float4>                     outImages[];
+[[vk::push_constant]]                           ConstantBuffer<PathtracePushConstant> pushConst;
+[[vk::binding(BindingPoints::eTextures, 0)]]    Texture2D allImages[];
+[[vk::binding(BindingPoints::eSamplers, 0)]]    SamplerState allSamplers[];
+[[vk::binding(BindingPoints::eTexturesHdr, 0)]] Sampler2D texturesHdr[];
+[[vk::binding(BindingPoints::eTlas, 1)]]        RaytracingAccelerationStructure topLevelAS;
+[[vk::binding(BindingPoints::eOutImages, 1)]]   RWTexture2D<float4> outImages[];
+[[vk::binding(BindingPoints::eOutDepth, 1)]]    RWTexture2D<float>  outDepth;
 
 // HDR Environment
-[[vk::binding(EnvBindings::eImpSamples, 2)]]    StructuredBuffer<EnvAccel>  envSamplingData;
+[[vk::binding(EnvBindings::eImpSamples, 2)]]    StructuredBuffer<EnvAccel> envSamplingData;
 
-[[vk::constant_id(0)]]          int USE_SER;
+// Specialization constants
+[[vk::constant_id(0)]]  int USE_SER = 1;
+[[vk::constant_id(1)]]  int USE_DLSS_TRANSP = 0; // Primary surface selection mode
 
 // clang-format on
 
-
-static bool doDebug = false;
-
-// Direct light structure
-struct DirectLight
-{
-  float3 direction;        // Direction to the light
-  float3 radianceOverPdf;  // Radiance over pdf
-  float  distance;         // Distance to the light
-  float  pdf;              // Probability of sampling this light
-};
-
-static const float MIN_TRANSMISSION = 0.01;  // Minimum transmission factor to continue tracing
-
-// #DLSS - Information for the DLSS
-struct DlssOutput
-{
-  float4 albedo          = float4(0);
-  float3 specularAlbedo  = float3(0);
-  float4 normalRoughness = float4(0);
-  float3 hitPosition     = 1e34f;
-};
-
-struct SampleResult
-{
-  float4     radiance   = float4(0, 0, 0, 0);
-  DlssOutput dlssOutput = {};  // DLSS output
-};
-
+#include "pathtrace_functions.h.slang"
 
 //-----------------------------------------------------------------------
-// Samples a 2D Gaussian distribution with a standard distribution of 1,
-// using the Box-Muller algorithm.
-// The input must be two random numbers in the range [0,1].
-//-----------------------------------------------------------------------
-float2 sampleGaussian(float2 u)
-{
-  const float r     = sqrt(-2.0f * log(max(1e-38f, u.x)));  // Radius
-  const float theta = 2.0f * M_PI * u.y;                    // Angle
-  return r * float2(cos(theta), sin(theta));
-}
-
-//-----------------------------------------------------------------------
-// Standard deviation of the Gaussian filter used for antialiasing,
-// in units of pixels.
-// This value of 1 / sqrt(8 ln(2)) makes it so that a Gaussian centered
-// on a pixel is at exactly 1/2 its maximum at the midpoints between
-// orthogonally adjacent pixels, and 1/4 its maximum at the "corners"
-// of pixels. It also empirically looks nice: larger values are
-// too blurry, and smaller values make thin lines look jagged.
-//-----------------------------------------------------------------------
-#define ANTIALIASING_STANDARD_DEVIATION 0.4246609F
-
-RayDesc getRay(float2 samplePos, float2 offset, float2 imageSize, float4x4 projMatrixI, float4x4 viewMatrixI)
-{
-  const float2 clipCoords = (samplePos + offset) / imageSize * 2.0 - 1.0;
-  float4       viewCoords = mul(float4(clipCoords, -1.0, 1.0), projMatrixI);
-  viewCoords /= viewCoords.w;
-
-  RayDesc ray;
-  ray.Origin    = viewMatrixI[3].xyz;
-  ray.Direction = normalize(mul(viewCoords, viewMatrixI).xyz - ray.Origin);
-  ray.TMin      = 0.0;
-  ray.TMax      = INFINITE;
-  return ray;
-}
-
-
-//-----------------------------------------------------------------------
-// This should sample any lights in the scene, but we only have the sun
-void sampleLights(in float3 pos, float3 normal, in float3 worldRayDirection, inout uint seed, out DirectLight directLight)
-{
-
-  float3 radiance             = float3(0.);
-  directLight.pdf             = 0.0;
-  directLight.distance        = INFINITE;
-  directLight.radianceOverPdf = float3(0.0);
-  float envPdf                = 0.0;
-
-  // We use the one-sample model to perform multiple importance sampling
-  // between point lights and environment lights.
-  // See section 9.2.4 of https://graphics.stanford.edu/papers/veach_thesis/thesis.pdf .
-
-  // Probability we'll select each sampling scheme (TODO: adjust these based on
-  // scene characteristics: light intensity vs environment intensity)
-  float lightWeight = (pushConst.gltfScene.numLights > 0) ? 0.5 : 0.0;
-  float envWeight =
-      ((pushConst.frameInfo->environmentType == EnvSystem::eSky) || pushConst.frameInfo.envIntensity.x > 0.0) ? 0.5 : 0.0;
-
-  // Normalize weights
-  float totalWeight = lightWeight + envWeight;
-  if(totalWeight == 0.0f)
-  {
-    return;  // No lights to sample
-  }
-
-  lightWeight /= totalWeight;
-  envWeight /= totalWeight;
-
-  // Decide whether to sample the light or the environment.
-  bool sampleLights = (rand(seed) <= lightWeight);
-
-  // We'll choose a direction from one technique, but for MIS we need the
-  // PDFs of each technique in the direction we chose. That's why we always get
-  // the light PDF (which is constant), but only sample a light if
-  // `sampleLights` is true.
-
-  // Lights
-  if(lightWeight > 0)
-  {
-    directLight.pdf = 1.0 / pushConst.gltfScene.numLights;
-    if(sampleLights)  // Use this technique for MIS?
-    {
-      int lightIndex = min(int(rand(seed) * pushConst.gltfScene.numLights), pushConst.gltfScene.numLights - 1);
-      GltfLight light = pushConst.gltfScene.lights[lightIndex];  // RenderLightBuf(sceneDesc.lightAddress)._[lightIndex];
-      LightContrib contrib  = singleLightContribution(light, pos, normal, float2(rand(seed), rand(seed)));
-      directLight.direction = -contrib.incidentVector;
-      radiance              = contrib.intensity / (directLight.pdf * lightWeight);
-      directLight.distance  = contrib.distance;
-    }
-  }
-
-  // Environment
-  if(envWeight > 0)
-  {
-    if(pushConst.frameInfo->environmentType == EnvSystem::eSky)
-    {
-      if(!sampleLights)  // Use this technique for MIS?
-      {
-        float2            random_sample = float2(rand(seed), rand(seed));
-        SkySamplingResult skySample     = samplePhysicalSky(*pushConst.skyParams, random_sample);
-        directLight.direction           = skySample.direction;
-        envPdf                          = skySample.pdf;
-        radiance                        = skySample.radiance / (envPdf * envWeight);
-      }
-      else
-      {
-        envPdf = samplePhysicalSkyPDF(*pushConst.skyParams, directLight.direction);
-      }
-    }
-    else
-    {
-      if(!sampleLights)  // Use this technique for MIS?
-      {
-        float3 rand_val = float3(rand(seed), rand(seed), rand(seed));
-        float4 radiance_pdf = environmentSample(texturesHdr[HDR_IMAGE_INDEX], envSamplingData, rand_val, directLight.direction);
-        envPdf                = radiance_pdf.w;
-        radiance              = radiance_pdf.xyz * pushConst.frameInfo.envIntensity / (envPdf * envWeight);
-        directLight.direction = rotate(directLight.direction, float3(0, 1, 0), pushConst.frameInfo.envRotation);
-      }
-      else
-      {
-        float3 dir          = rotate(directLight.direction, float3(0, 1, 0), -pushConst.frameInfo->envRotation);
-        float2 uv           = getSphericalUv(dir);
-        float4 radiance_pdf = texturesHdr[HDR_IMAGE_INDEX].SampleLevel(uv, 0);
-        envPdf              = radiance_pdf.w;
-      }
-    }
-  }
-
-  // MIS weight calculation
-  float misWeight = (sampleLights ? directLight.pdf : envPdf) / (directLight.pdf + envPdf);
-  radiance *= misWeight;
-  // Update the total PDF
-  directLight.pdf = lightWeight * directLight.pdf + envWeight * envPdf;
-
-  directLight.radianceOverPdf = radiance;  // Radiance over PDF
-  return;
-}
-
-
-//----------------------------------------------------------
-// Testing if the hit is opaque or alpha-transparent
-// Return true is opaque
-//----------------------------------------------------------
-float getOpacity(GltfRenderNode renderNode, GltfRenderPrimitive renderPrim, int triangleID, float3 barycentrics)
-{
-  // Scene materials
-  uint               matIndex  = max(0, renderNode.materialID);
-  GltfShadeMaterial* materials = pushConst.gltfScene->materials;  // Buffer of materials
-  GltfShadeMaterial  mat       = materials[matIndex];
-  GltfTextureInfo*   texInfos  = pushConst.gltfScene->textureInfos;
-
-  if(mat.alphaMode == AlphaMode::eAlphaModeOpaque)
-    return 1.0;
-
-  // Getting the 3 indices of the triangle (local)
-  uint3 triangleIndex = getTriangleIndices(renderPrim, triangleID);
-
-  float baseColorAlpha = 1;
-  if(mat.usePbrSpecularGlossiness == 0)
-  {
-    baseColorAlpha = mat.pbrBaseColorFactor.a;
-    if(isTexturePresent(mat.pbrBaseColorTexture))
-    {
-      // Retrieve the interpolated texture coordinate from the vertex
-      float2 uv = getInterpolatedVertexTexCoord0(renderPrim, triangleIndex, barycentrics);
-
-      GltfTextureInfo texInfo = texInfos[mat.pbrBaseColorTexture];
-      baseColorAlpha *= allTextures[texInfo.index].SampleLevel(uv, 0.0f).a;
-    }
-  }
-  else
-  {
-    baseColorAlpha = mat.pbrDiffuseFactor.a;
-    if(isTexturePresent(mat.pbrDiffuseTexture))
-    {
-      float2 uv = getInterpolatedVertexTexCoord0(renderPrim, triangleIndex, barycentrics);
-
-      GltfTextureInfo texInfo = texInfos[mat.pbrDiffuseTexture];
-      baseColorAlpha *= allTextures[texInfo.index].SampleLevel(uv, 0.0f).a;
-    }
-  }
-
-  baseColorAlpha *= getInterpolatedVertexColor(renderPrim, triangleIndex, barycentrics).a;
-
-  if(mat.alphaMode == AlphaMode::eAlphaModeMask)
-  {
-    return baseColorAlpha >= mat.alphaCutoff ? 1.0 : 0.0;
-  }
-
-  return baseColorAlpha;
-}
-
-float3 getShadowTransmission(GltfRenderNode      renderNode,
-                             GltfRenderPrimitive renderPrim,
-                             int                 triangleID,
-                             float3              barycentrics,
-                             float               hitT,
-                             float4x3            worldToObject,
-                             float3              rayDirection,
-                             inout bool          isInside)
-{
-  uint               matIndex  = max(0, renderNode.materialID);
-  GltfShadeMaterial* materials = pushConst.gltfScene->materials;  // Buffer of materials
-  GltfShadeMaterial  mat       = materials[matIndex];
-  GltfTextureInfo*   texInfos  = pushConst.gltfScene->textureInfos;
-
-  // If hit a non-transmissive surface, terminate with full shadow
-  if(mat.transmissionFactor <= MIN_TRANSMISSION)
-  {
-    return float3(0.0);
-  }
-
-  // Get triangle indices and compute normal
-  uint3 indices = getTriangleIndices(renderPrim, triangleID);
-
-  float3 normal;
-  {
-    // Compute geometric normal
-    float3 v0 = getVertexPosition(renderPrim, indices.x);
-    float3 v1 = getVertexPosition(renderPrim, indices.y);
-    float3 v2 = getVertexPosition(renderPrim, indices.z);
-    float3 e1 = v1 - v0;
-    float3 e2 = v2 - v0;
-    normal    = normalize(cross(e1, e2));
-    normal    = normalize(float3(mul(worldToObject, normal).xyz));
-  }
-
-  // Transmission calculation
-  float3 currentTransmission = float3(mat.transmissionFactor);
-
-  // Regular transmission with Fresnel using normal
-  float cosTheta = abs(dot(rayDirection, normal));
-  float fresnel  = schlickFresnel(mat.ior, cosTheta);
-  currentTransmission *= float3((1.0 - fresnel));
-
-  // Apply material color tint to transmission
-  currentTransmission *= mat.pbrBaseColorFactor.rgb;
-
-  // Volume attenuation (Beer's law)
-  if(mat.thicknessFactor > 0.0)
-  {
-    if(isInside)
-    {
-      // Calculate per-channel attenuation with improved color preservation
-      float3 absorbance = -log(max(mat.attenuationColor, float3(0.001))) / max(mat.attenuationDistance, 0.001);
-      float3 attenuation;
-      attenuation.r = exp(-hitT * absorbance.r);
-      attenuation.g = exp(-hitT * absorbance.g);
-      attenuation.b = exp(-hitT * absorbance.b);
-
-      currentTransmission *= attenuation;
-    }
-    isInside = !isInside;
-  }
-
-  // Attenuation due to roughness and metallic
-  float transmissionAttenuation = 1.0;
-  {
-    float roughness = mat.pbrRoughnessFactor;
-    float metallic  = mat.pbrMetallicFactor;
-    if(isTexturePresent(mat.pbrMetallicRoughnessTexture))
-    {
-      float2 tc[2];
-      tc[0] = getInterpolatedVertexTexCoord0(renderPrim, indices, barycentrics);
-      tc[1] = getInterpolatedVertexTexCoord1(renderPrim, indices, barycentrics);
-
-      float4 mr_sample = allTextures[texInfos[mat.pbrMetallicRoughnessTexture].index].SampleLevel(tc[0], 0.0f);
-      roughness *= mr_sample.g;
-      metallic *= mr_sample.b;
-    }
-
-    // Metallic completely blocks transmission
-    transmissionAttenuation *= (1.0 - metallic);
-
-    // Roughness reduces transmission non-linearly
-    float roughnessEffect = 1.0 - (roughness * roughness);
-    transmissionAttenuation *= lerp(0.65, 1.0, roughnessEffect);
-  }
-  currentTransmission *= transmissionAttenuation;
-
-  return currentTransmission;
-}
-
-//-----------------------------------------------------------------------
-// Shoot a ray and store 1 if the ray hits the selected object
-void selectObject(float2 samplePos, float2 imageSize)
-{
-  // Subpixel jitter: send the ray through a different position inside the pixel each time, to provide antialiasing.
-  const float2 subpixel_jitter = float2(0.5f, 0.5f);
-  const float2 clipCoords      = (samplePos + subpixel_jitter) / imageSize * 2.0 - 1.0;
-  float4       viewCoords      = mul(float4(clipCoords, -1.0, 1.0), pushConst.frameInfo->projInv);
-  viewCoords /= viewCoords.w;
-
-  RayDesc ray;
-  ray.Origin =
-      float3(pushConst.frameInfo->viewInv[3].x, pushConst.frameInfo->viewInv[3].y, pushConst.frameInfo->viewInv[3].z);
-  ray.Direction = normalize(mul(viewCoords, pushConst.frameInfo->viewInv).xyz - ray.Origin);
-  ray.TMin      = 0.0;
-  ray.TMax      = INFINITE;
-
-  RayQuery q;
-  q.TraceRayInline(topLevelAS, RAY_FLAG_NONE, 0xFF, ray);
-
-  while(q.Proceed())
-  {
-    q.CommitNonOpaqueTriangleHit();
-  }
-
-  float hitObj = 0.0;
-  if(q.CommittedStatus() != COMMITTED_NOTHING)
-  {
-    int rprimID = q.CommittedInstanceIndex();
-    if(rprimID != -1 && rprimID == pushConst.frameInfo->selectedRenderNode)
-    {
-      hitObj = 1.0f;
-    }
-  }
-  // Store the hit object in the selection image
-  outImages[int(OutputImage::eSelectImage)][int2(samplePos)] = float4(hitObj, 0, 0, 0);
-}
-
-//-----------------------------------------------------------------------
-// Check for infinite plane intersection and update hit state if needed
-//-----------------------------------------------------------------------
-bool checkInfinitePlaneIntersection(RayDesc ray, inout HitPayload payload, inout HitState hit, SceneFrameInfo* frameInfo)
-{
-  if (frameInfo.useInfinitePlane != 1)
-    return false;
-
-  // Plane definition
-  float3 normal      = float3(0, 1, 0);                  // Y-up plane normal
-  float  planeHeight = frameInfo.infinitePlaneDistance;  // Height of plane from origin (0, planeHeight, 0)
-
-  // Only report intersection if camera is above the plane
-  if(ray.Origin.y <= planeHeight)
-    return false;
-
-  // Calculate denominator for ray-plane intersection: dot product of plane normal and ray direction
-  // If this is close to zero, the ray is parallel to the plane
-  float Dn = dot(ray.Direction, normal);
-  if(abs(Dn) <= 1e-6)
-    return false;
-
-  float On               = dot(ray.Origin, normal);
-  float intersectionDist = (-On + planeHeight) / Dn;
-  if(intersectionDist <= 0 || (intersectionDist >= payload.hitT))
-    return false;
-
-  // Update hit information
-  payload.hitT     = intersectionDist;  // Update hit distance
-  hit.pos          = ray.Origin + ray.Direction * payload.hitT;
-  hit.nrm          = normal;           // Plane normal pointing up
-  hit.geonrm       = normal;           // Geometric normal is the same as the plane normal
-  hit.tangent      = float3(1, 0, 0);  // Arbitrary tangent
-  hit.bitangent    = float3(0, 0, 1);  // Arbitrary bitangent
-  
-  return true;  // We hit the infinite plane
-}
-
-//-----------------------------------------------------------------------
-// Path tracing
+// PATH TRACE ONE BOUNCE
 //
-// This function:
-// 1. Traces rays through a scene, bouncing them off surfaces according to their material
-//    properties (like reflection, transmission, etc.) up to a maximum depth
-// 2. At each intersection, it calculates direct lighting contribution from light sources
-//    (currently only sky/sun) and samples the BSDF to determine the next ray direction
-// 3. Accumulates radiance along the path while applying Russian Roulette for optimization,
-//    handling both surface and volumetric effects, and returns the final color contribution for that ray path
-//
-SampleResult pathTrace(IRaytracer raytracer, RayDesc ray, inout uint seed)
+// This function performs a single bounce of path tracing in the renderer. It traces a ray through the scene,
+// handles intersection and shading logic for the first or subsequent bounces, and updates path tracing state
+// and bounce scratch data accordingly. It manages ray-scene intersections, material retrieval, handling
+// of missed rays (e.g., environment hits), and prepares data for direct/indirect lighting and next events.
+//-----------------------------------------------------------------------
+PathStepResult pathTraceOneBounce(IRaytracer raytracer, inout RayDesc ray, inout uint seed, inout PathTracerState pt, out BounceScratch bounce)
 {
-  SampleResult sampleResult = {};
-  float3       radiance     = float3(0.0F, 0.0F, 0.0F);
-  float3       throughput   = float3(1.0F, 1.0F, 1.0F);
-  bool         isInside     = false;
-  float2       maxRoughness = float2(0.0);
+  // Initialize the bounce scratch data
+  bounce.nextEventValid = false;
+  bounce.contribution   = float3(0);
+  bounce.shadowRayPos   = float3(0);
+  bounce.shadowRayDir   = float3(0);
+  bounce.shadowRayDist  = 0.0f;
 
-  SceneFrameInfo* frameInfo = pushConst.frameInfo;
-
-  HitPayload payload = {};
-
-  float lastSamplePdf = DIRAC;
-
-  // Path tracing loop, until the ray hits the environment or the maximum depth is reached or the ray is absorbed
-  for(int depth = 0; depth < pushConst.maxDepth; depth++)
   {
+    //DirectLight directLight;
+    SceneFrameInfo* frameInfo = pushConst.frameInfo;
+    HitPayload      payload   = {};
+
     // Trace the ray through the scene
-    raytracer.Trace(ray, payload, seed, depth);
+    raytracer.Trace(ray, payload, seed);
 
-    // Getting the hit information (primitive/mesh that was hit)
-    HitState hit = payload.hitState;
+    // Getting the scene information
+    GltfRenderNode*      renderNodes     = pushConst.gltfScene->renderNodes;
+    GltfRenderPrimitive* renderPrimitive = pushConst.gltfScene->renderPrimitives;
 
-    bool firstRay = (depth == 0);
+    // If we hit something, get the hit state
+    HitState            hit        = {};
+    GltfRenderNode      renderNode = {};
+    GltfRenderPrimitive renderPrim = {};
+    if(payload.hitT != INFINITE)
+    {
+      renderNode   = renderNodes[payload.rnodeID];
+      renderPrim   = renderPrimitive[payload.rprimID];
+      float3 barys = float3(1.0 - payload.bary.x - payload.bary.y, payload.bary.x, payload.bary.y);
+      hit = getHitState(renderPrim, barys, renderNode.worldToObject, renderNode.objectToWorld, payload.primitiveID, ray.Direction);
+    }
+
+    // Check if we are on the first ray
+    bool firstRay = (pt.surfaceDepth == 0);
 
     // Check if we hit the infinite plane
     bool hitInfinitePlane = checkInfinitePlaneIntersection(ray, payload, hit, frameInfo);
 
-    // Hitting the environment, then exit
+    //-----------------------------------------------------------------------
+    // Hitting the environment
+    //-----------------------------------------------------------------------
     if(payload.hitT == INFINITE)
     {
-      if(firstRay)  // If we come in here, the first ray didn't hit anything
+      // Check if we hit the backplate
+      if(firstRay && tryPrimaryMissBackplate(ray, frameInfo, pt))
+        return PathStepResult.eBreak;
+
+#if USE_DLSS_SHADER
+      // #DLSS - If capturing specular hit and we hit environment, use max distance (65504 = fp16 max)
+      // This happens when a glossy reflection bounces into the sky.
+      if(pt.guide.captureSpecularHit)
       {
-        sampleResult.radiance.a = 0.0;  // Set it to transparent
-
-        // Solid color background and blurred HDR environment, aren't part of the
-        // lighting equation (backplate), so we can return them directly.
-        if(frameInfo->useSolidBackground == 1)
-        {
-          sampleResult.radiance.rgb = frameInfo->backgroundColor;
-          return sampleResult;
-        }
-        else if(pushConst.frameInfo->environmentType == EnvSystem::eHdr && pushConst.frameInfo->envBlur > 0)
-        {
-          float3 dir = rotate(ray.Direction, float3(0, 1, 0), -frameInfo.envRotation);
-          float2 uv  = getSphericalUv(dir);  // See sampling.glsl
-          sampleResult.radiance.xyz =
-              smoothHDRBlur(texturesHdr[HDR_IMAGE_INDEX], uv, frameInfo->envBlur).xyz * frameInfo->envIntensity;
-          return sampleResult;
-        }
+        pt.guide.specularHitDist    = float16_t(65504.0f);
+        pt.guide.captureSpecularHit = false;
       }
+#endif  // USE_DLSS_SHADER
 
-      // Add sky or HDR texture
+      // Add sky or HDR texture using refactored helper
       float3 envColor;
       float  envPdf;
-      if(frameInfo->environmentType == EnvSystem::eSky)
-      {
-        envColor = evalPhysicalSky(*pushConst.skyParams, ray.Direction);
-        envPdf   = samplePhysicalSkyPDF(*pushConst.skyParams, ray.Direction);
-      }
-      else
-      {
-        // Adding HDR lookup
-        float3 dir = rotate(ray.Direction, float3(0, 1, 0), -frameInfo.envRotation);
-        float2 uv  = getSphericalUv(dir);  // See sampling.glsl
-        float4 env = texturesHdr[HDR_IMAGE_INDEX].SampleLevel(uv, 0);
-        envColor   = env.rgb * frameInfo.envIntensity;
-        envPdf     = env.w;
-      }
+      sampleEnvironment(ray.Direction, frameInfo, envColor, envPdf);
 
       // We may hit the environment twice: once via sampleLights() and once when hitting the sky while probing
       // for more indirect hits. This is the counter part of the MIS weighting in sampleLights()
-      float misWeight = (lastSamplePdf == DIRAC) ? 1.0 : (lastSamplePdf / (lastSamplePdf + envPdf));
-      radiance += throughput * misWeight * envColor;
+      float misWeight = computeEnvHitMisWeight(pt.lastSamplePdf, envPdf);
+      pt.radiance += pt.throughput * misWeight * envColor;
 
-      sampleResult.radiance.xyz = radiance;
-      return sampleResult;
+      return PathStepResult.eBreak;
     }
 
+    GltfShadeMaterial* materials     = pushConst.gltfScene->materials;
+    GltfTextureInfo*   texInfos      = pushConst.gltfScene->textureInfos;
+    int                materialIndex = -1;
+    PbrMaterial        pbrMat;
 
-    PbrMaterial       pbrMat;
-    GltfShadeMaterial material;
+    // Compute the ray-cone footprint at the hit point which is used to compute the texture-LOD gradient
+    float worldFoot = rayConeWorldFootprint(pt.cone, payload.hitT, hit.geonrm, -ray.Direction);
+
+    //-----------------------------------------------------------------------
+    // Hitting the infinite plane
+    //-----------------------------------------------------------------------
     if(hitInfinitePlane)
     {
-        // Evaluate the material at the hit point
-        pbrMat = defaultPbrMaterial(frameInfo.infinitePlaneBaseColor, frameInfo.infinitePlaneMetallic, frameInfo.infinitePlaneRoughness, hit.nrm, hit.nrm);
-      material           = defaultGltfMaterial();
+      // Replaced the material at the hit point with the infinite plane material
+      pbrMat = defaultPbrMaterial(frameInfo->infinitePlaneBaseColor, frameInfo->infinitePlaneMetallic,
+                                  frameInfo->infinitePlaneRoughness, hit.nrm, hit.nrm);
+
+      // Shadow catcher: invisible plane that shows only shadows for compositing
+      if(hasFlag(frameInfo->flags, SceneFrameInfoFlags::eSceneInfinitePlaneShadowCatcher))
+      {
+        // Propagate cone through plane bounce before potential early continue from shadow-catcher path.
+        pt.cone.width = worldFoot;
+        bool continuePath =
+            handleShadowCatcher(raytracer, hit, pbrMat, ray, pt.radiance, pt.throughput, pt.lastSamplePdf, seed, frameInfo);
+        if(!continuePath)
+          return PathStepResult.eBreak;  // Catch the shadow
+        return PathStepResult.eEarlyContinue;  // Continue the path tracing from the infinite plane, missed the shadow catcher path
+      }
     }
+    //-----------------------------------------------------------------------
+    // Hitting the mesh
+    //-----------------------------------------------------------------------
     else
     {
-      // Getting the scene information
-      GltfShadeMaterial*   materials       = pushConst.gltfScene->materials;         // Buffer of materials
-      GltfRenderNode*      renderNodes     = pushConst.gltfScene->renderNodes;       // Buffer of render nodes
-      GltfRenderPrimitive* renderPrimitive = pushConst.gltfScene->renderPrimitives;  // Buffer of meshes
-      GltfTextureInfo*     texInfos        = pushConst.gltfScene->textureInfos;      // Buffer of texture infos
+      // Find material at the hit point and evaluate the material (PBR material evaluation)
 
-      // Setting up the material
-      GltfRenderPrimitive renderPrim    = renderPrimitive[payload.rprimID];  // Primitive information
-      GltfRenderNode      renderNode    = renderNodes[payload.rnodeID];      // Node information
-      int                 materialIndex = max(0, renderNode.materialID);     // Material ID of hit mesh
-      material                          = materials[materialIndex];          // Material of the hit object
+      materialIndex = max(0, renderNode.materialID);
 
-      material.pbrBaseColorFactor *= hit.color;  // Modulate the base color with the vertex color
+      float     texGrad = worldFoot * hit.texelDensity * pushConst.texGradScale;
+      MeshState mesh    = MeshState(hit.nrm, hit.tangent, hit.bitangent, hit.geonrm, hit.uv, ptIsInside(pt), texGrad);
+      mesh.baseColorVertexMul = hit.color;
+      pbrMat                  = evaluateMaterial(materialIndex, mesh, allImages, allSamplers, texInfos, materials);
 
-      // Evaluate the material at the hit point
-      MeshState mesh = MeshState(hit.nrm, hit.tangent, hit.bitangent, hit.geonrm, hit.uv, isInside);
-      pbrMat         = evaluateMaterial(material, mesh, allTextures, texInfos);
+#if WIREFRAME
+      // Wireframe is only used for the camera-visible surface, so compute it once here on the
+      // first hit (instead of every Trace() like the old payload-routed version did). All inputs
+      // are already in scope, so this avoids carrying wireframeAlpha + pixelAngle in the payload.
+      if(firstRay)
+      {
+        uint3 triIdx = getTriangleIndices(renderPrim, payload.primitiveID);
+        pt.firstHitWireframeAlpha =
+            computeMeshWireframe(renderNode.objectToWorld, getVertexPosition(renderPrim, triIdx.x),
+                                 getVertexPosition(renderPrim, triIdx.y), getVertexPosition(renderPrim, triIdx.z),
+                                 payload.bary, payload.hitT, pushConst.pixelAngle, hit.geonrm, -ray.Direction);
+      }
+#endif
     }
 
-    // #DLSS - Gather data from first hit
+#if USE_DLSS_SHADER
+    // #DLSS - Capture specular hit distance on depth 1 (first reflection bounce)
+    if(pt.guide.captureSpecularHit)
+    {
+      pt.guide.specularHitDist    = float16_t(payload.hitT);
+      pt.guide.captureSpecularHit = false;
+    }
+#endif  // USE_DLSS_SHADER
+
+    //-----------------------------------------------------------------------
+    // First-hit captures (NDC-depth always; DLSS/OptiX guide buffers when on).
+    //-----------------------------------------------------------------------
     if(firstRay)
     {
-      sampleResult.dlssOutput.albedo = float4(pbrMat.baseColor.xyz, 1.0f);
-      sampleResult.dlssOutput.specularAlbedo =
-          EnvBRDFApprox2(pbrMat.specularColor, pbrMat.roughness.x, dot(pbrMat.N, ray.Direction));
-      sampleResult.dlssOutput.normalRoughness = float4(pbrMat.N, pbrMat.roughness.x);
-      sampleResult.dlssOutput.hitPosition     = ray.Origin + ray.Direction * payload.hitT;
+      // Always record the first hit position; drives the NDC depth output used by
+      // selection/picking, independent of DLSS/OptiX.
+      pt.firstHitPos = hit.pos;
+
+#if USE_GUIDE_SHADER
+      // #DLSS instance motion - Previous-frame world position of this surface point.
+      pt.firstHitPosPrev = hit.pos;
+      if(!hitInfinitePlane && pushConst.prevRenderNodeObjectToWorld != nullptr)
+      {
+        float3 objPos      = mul(float4(hit.pos, 1.0), renderNode.worldToObject).xyz;
+        pt.firstHitPosPrev = mul(float4(objPos, 1.0), pushConst.prevRenderNodeObjectToWorld[payload.rnodeID]).xyz;
+      }
+
+      // Base-color guide albedo (shared by DLSS and OptiX). Stored temporarily, written at end to
+      // reduce live state.
+      float3 guideAlbedo = pbrMat.baseColor.xyz;
+#if USE_DLSS_SHADER
+      // #DLSS specular guide - specular albedo + clear-glass albedo refinement. DLSS-only quality
+      // path; OptiX needs neither, so it is compiled out of the OptiX/no-denoiser variant.
+      // Apply KHR_materials_specular energy conservation clamping for DLSS guide buffer
+      // Spec formula: dielectric_f0 = min(f0_from_ior * specularColor, 1.0) * specular
+      float  f0_from_ior          = pow((pbrMat.ior2 - pbrMat.ior1) / (pbrMat.ior2 + pbrMat.ior1), 2.0F);
+      float3 specularColorClamped = min(f0_from_ior * pbrMat.specularColor, float3(1.0F));
+      float3 specularAlbedo = EnvBRDFApprox2(specularColorClamped, pbrMat.roughness.x, dot(pbrMat.N, ray.Direction));
+      if(USE_DLSS_TRANSP == 1 && !hasFlag(pushConst.flags, PathtracerFlags::ePtUseOptixDenoiser) && dlssIsClearGlass(pbrMat))
+      {
+        guideAlbedo = dlssGetClearGlassGuideAlbedo(raytracer, pbrMat, hit, ray.Direction, frameInfo, seed,
+                                                   ptIsInside(pt), specularAlbedo);
+      }
+      pt.guide.specularAlbedo = float16_t3(specularAlbedo);
+#endif  // USE_DLSS_SHADER
+      pt.guide.normalRoughness = float16_t4(float16_t3(pbrMat.N), float16_t(pbrMat.roughness.x));
+      pt.guide.albedo          = float16_t3(guideAlbedo);
+#endif  // USE_GUIDE_SHADER
     }
 
+    // Keep track of the maximum roughness to prevent firefly artifacts by forcing subsequent bounces to be at least as rough
+    pt.maxRoughness  = max(pbrMat.roughness, pt.maxRoughness);
+    pbrMat.roughness = pt.maxRoughness;
 
-    // Keep track of the maximum roughness to prevent firefly artifacts
-    // by forcing subsequent bounces to be at least as rough
-    maxRoughness     = max(pbrMat.roughness, maxRoughness);
-    pbrMat.roughness = maxRoughness;
-
-    // Debugging, single frame
-    if(frameInfo.debugMethod != DebugMethod::eNone && firstRay)
+    //-----------------------------------------------------------------------
+    // Visualization override (Debug mode)
+    // Note: clay visualization mode continues shading; flat-color modes break
+    //-----------------------------------------------------------------------
+    // Debug-only; compiled out of the normal render path (USE_VISUALIZE, set by the host when the
+    // visualization mode is not eRendered).
+#if USE_VISUALIZE
+    if(frameInfo->visualization != Visualization::eRendered)
     {
-      sampleResult.radiance.xyz = debugValue(pbrMat, hit, frameInfo.debugMethod);
-      sampleResult.radiance.a   = 1.0;
-      return sampleResult;
+      float3              vizColor;
+      VisualizationResult vizResult = applyVisualization(pbrMat, hit, frameInfo->visualization, payload.rprimID,
+                                                         payload.primitiveID, payload.ommUnknown ? 1 : 0, vizColor);
+      if(vizResult == VisualizationResult::eColorOverride && firstRay)
+      {
+        pt.radiance.xyz = vizColor;
+        return PathStepResult.eBreak;
+      }
     }
+#endif
 
-
+    //-----------------------------------------------------------------------
     // Adding emissive
-    radiance += pbrMat.emissive * throughput;
+    //-----------------------------------------------------------------------
+    // Emitters that are also sampled as area lights (constant emissive, no emissive texture) get
+    // hit by BSDF rays too; MIS-weight those against the light technique, mirroring the env-hit
+    // MIS above. Textured emitters are not in the light list, so they stay unweighted.
+    if(any(pbrMat.emissive > float3(0.0)))
+    {
+      float emissiveMis = 1.0;
+      if(!hitInfinitePlane && !isTexturePresent(materials[materialIndex].emissiveTexture))
+      {
+        // Power-weighted MIS pdf needs only the emitter's own radiance, its geometric normal, and
+        // W_total (the area cancels) -- no per-triangle lookup.
+        emissiveMis = computeEmitterHitMisWeight(pt.lastSamplePdf, pbrMat.emissive, hit.geonrm, ray.Direction, payload.hitT);
+      }
+      pt.radiance += emissiveMis * pbrMat.emissive * pt.throughput;
+    }
 
+    //-----------------------------------------------------------------------
     // Unlit
-    if(material.unlit > 0)
+    //-----------------------------------------------------------------------
+#if GLTF_USE_UNLIT
+    if(materialIndex >= 0 && materials[materialIndex].unlit > 0)
     {
-      radiance += pbrMat.baseColor;
-      sampleResult.radiance.xyz = radiance;
-      sampleResult.radiance.a   = 1.0;
-      return sampleResult;
+      pt.radiance += pbrMat.baseColor;
+      return PathStepResult.eBreak;
     }
+#endif
 
-    // Apply volume attenuation
-    if(isInside && !pbrMat.isThinWalled)
-    {
-      const float3 abs_coeff = absorptionCoefficient(pbrMat);
-      throughput *= exp(-payload.hitT * abs_coeff);
-    }
+    PathStepResult volumeStep = processVolumeSegment(raytracer, payload.hitT, ray, pt, seed);
+    if(volumeStep != PathStepResult.eOutOfVolume)
+      return volumeStep;  // Skip the surface bounce if the ray is still in the volume (ray is scattered)
 
+    // Normal surface bounce: propagate the cone footprint to the next segment. The new ray
+    // starts at hit.pos with the slant-corrected worldFoot as its starting width, so the
+    // next Trace()'s texture LOD inherits the full accumulated footprint.
+    pt.cone.width = worldFoot;
 
-    float3 contribution = float3(0);  // Direct lighting contribution
-
-    // Light contribution; can be environment or punctual lights
+    //-----------------------------------------------------------------------
+    // Sampling the lights
+    // - Get the light contribution from one light source or the HDR environment
+    //-----------------------------------------------------------------------
     DirectLight directLight;
-    sampleLights(hit.pos, pbrMat.N, ray.Direction, seed, directLight);
+    sampleLights(hit.pos, pbrMat.N, ray.Direction, seed, directLight, /*isVolumeSample=*/false,
+                 /*lightsFromBothSides=*/pbrMat.diffuseTransmissionFactor > 0.0f);
 
-    // Do not next event estimation (but delay the adding of contribution)
-    bool nextEventValid = (dot(directLight.direction, hit.geonrm) > 0.0f || pbrMat.diffuseTransmissionFactor > 0.0f)
-                          && directLight.pdf != 0.0f;
+    // This checks if the light could contribute, but doesn't send a next event estimation (NEE) shadow ray yet.
+    // The actual test and contribution are delayed to minimize per-bounce state.
+    bounce.nextEventValid = (dot(directLight.direction, hit.nrm) > 0.0f || pbrMat.diffuseTransmissionFactor > 0.0f)
+                            && directLight.pdf != 0.0f;
 
-    // Evaluate BSDF for Light
-    if(nextEventValid)
+    //-----------------------------------------------------------------------
+    // Evaluating the BSDF for the light
+    //-----------------------------------------------------------------------
+    if(bounce.nextEventValid)
     {
-      // Evaluate the BSDF at the hit point
+      // Evaluating the BSDF at the hit point for the light
       BsdfEvaluateData evalData;
       evalData.k1 = -ray.Direction;
       evalData.k2 = directLight.direction;
       evalData.xi = float3(rand(seed), rand(seed), rand(seed));
       bsdfEvaluate(evalData, pbrMat);
+      // bsdfEvaluateSimple(evalData, pbrMat);
 
       // If the PDF is greater than 0, then we can sample the BSDF
       if(evalData.pdf > 0.0)
@@ -639,74 +359,160 @@ SampleResult pathTrace(IRaytracer raytracer, RayDesc ray, inout uint seed)
         const float mis_weight = (directLight.pdf == DIRAC) ? 1.0F : directLight.pdf / (directLight.pdf + evalData.pdf);
 
         // sample weight
-        const float3 w = throughput * directLight.radianceOverPdf * mis_weight;
-        contribution += w * evalData.bsdf_diffuse;
-        contribution += w * evalData.bsdf_glossy;
+        const float3 w = pt.throughput * directLight.radianceOverPdf * mis_weight;
+        bounce.contribution += w * evalData.bsdf_diffuse;
+        bounce.contribution += w * evalData.bsdf_glossy;
       }
     }
 
+    //-----------------------------------------------------------------------
+    // Sampling the BSDF :
+    // - Finding the next direction and updating the throughput
+    //-----------------------------------------------------------------------
     {
-      // Sample the BSDF
+      // Sampling the BSDF at the hit point
       BsdfSampleData sampleData;
       sampleData.k1 = -ray.Direction;                              // outgoing direction
       sampleData.xi = float3(rand(seed), rand(seed), rand(seed));  // random number
       bsdfSample(sampleData, pbrMat);
+      // bsdfSampleSimple(sampleData, pbrMat);
 
-      // Update the throughput
-      throughput *= sampleData.bsdf_over_pdf;
-      ray.Direction = sampleData.k2;  // new direction
-      lastSamplePdf = sampleData.pdf;
+      // Update the pt.throughput
+      pt.throughput *= sampleData.bsdf_over_pdf;
+      ray.Direction    = sampleData.k2;  // new direction
+      pt.lastSamplePdf = sampleData.pdf;
 
-      // If the ray is absorbed, then break
-      if(sampleData.event_type == BSDF_EVENT_ABSORB)
+#if USE_DLSS_SHADER
+      // #DLSS - Enable specular hit distance capture on first bounce if this is a glossy reflection
+      // Matches reference implementation: only capture for BSDF_EVENT_GLOSSY_REFLECTION
+      if(firstRay && (sampleData.event_type == BSDF_EVENT_GLOSSY_REFLECTION || sampleData.event_type == BSDF_EVENT_IMPULSE_REFLECTION))
       {
-        // Exit tracing rays, but still finish this iteration; in particular the visibility test
-        // for the light that we may have hit.
-        depth = pushConst.maxDepth;
+        pt.guide.captureSpecularHit = true;
       }
-      else
+#endif  // USE_DLSS_SHADER
+
+      // The ray wasn't absorbed, so we can continue the path
+      if(sampleData.event_type != BSDF_EVENT_ABSORB)
       {
-        // Continue path
+        // Continue path (bounce)
         bool isSpecular     = (sampleData.event_type & BSDF_EVENT_IMPULSE) != 0;
         bool isTransmission = (sampleData.event_type & BSDF_EVENT_TRANSMISSION) != 0;
 
+        // Compute the offset position for the next bounce
         float3 offsetDir = dot(ray.Direction, hit.geonrm) > 0 ? hit.geonrm : -hit.geonrm;
-        ray.Origin       = offsetRay(hit.pos, offsetDir);
+        ray.Origin       = safeOffsetRay(hit.pos, offsetDir);
 
-        // Flip the information if we are inside the object, but only if it is a solid object
-        // The doubleSided flag is used to know if the object is solid or thin-walled.
-        // This is not a glTF specification, but works in many cases.
+        // Toggle 'pt.isInside' to track whether the ray is currently inside or outside geometry.
+        // This update is necessary for correctly handling transmission (refraction) through solid (non-thin-walled) materials.
+        // For thin-walled surfaces - like decals or leaves - this state isn't toggled, because there's no real "inside".
+        //
+        // Gated on GLTF_USE_TRANSMISSION: scenes without transmission never produce
+        // BSDF_EVENT_TRANSMISSION, so this branch is dead. makeVolumeMedium only when
+        // GLTF_USE_VOLUME is on (medium has nowhere to live otherwise).
+#if GLTF_USE_TRANSMISSION
         if(isTransmission)
         {
-          isInside = !isInside;
+          pt.isInside = !pt.isInside;
+#if GLTF_USE_VOLUME
+          if(pt.isInside)
+            pt.volumeMedium = makeVolumeMedium(pbrMat);  // Entering volume: capture the medium for scatter/absorption
+#endif
         }
+#endif
       }
+      else if(sampleData.event_type == BSDF_EVENT_ABSORB)  // If the ray is absorbed , then break
+      {
+        // Exit tracing rays, but still finish this iteration; in particular the visibility test
+        // for the light that we may have hit.
+        pt.surfaceDepth = pushConst.maxDepth;
+      }
+
+      // End scope to free live states
     }
 
-    // We are adding the contribution to the radiance only if the ray is not occluded by an object.
-    if(nextEventValid)
-    {
-      // shadow origin is the hit position offset by a small amount in the direction of the light
-      float3 shadowRayOrigin = offsetRay(hit.pos, (dot(directLight.direction, hit.geonrm) > 0.0f) ? hit.geonrm : -hit.geonrm);
-      RayDesc shadowRay    = RayDesc(shadowRayOrigin, 0, directLight.direction, directLight.distance);
-      float3  shadowFactor = raytracer.TraceShadow(shadowRay, seed);
-      radiance += contribution * shadowFactor;
-    }
-
-    // Russian-Roulette (minimizing live state)
-    float rrPcont = min(max(throughput.x, max(throughput.y, throughput.z)) + 0.001F, 0.95F);
-    if(rand(seed) >= rrPcont)
-      break;                // paths with low throughput that won't contribute
-    throughput /= rrPcont;  // boost the energy of the non-terminated paths
+    //-----------------------------------------------------------------------
+    // Finding the shadow ray position and direction
+    //-----------------------------------------------------------------------
+    bool   shadowSideForward = dot(directLight.direction, hit.nrm) > 0.0F;
+    float3 shadowOffsetDir   = shadowSideForward ? hit.geonrm : -hit.geonrm;
+    float3 shadowOffsetBase  = shadowSideForward ? hit.shadowPos : hit.pos;
+    bounce.shadowRayPos      = safeOffsetRay(shadowOffsetBase, shadowOffsetDir);
+    bounce.shadowRayDir      = directLight.direction;
+    bounce.shadowRayDist     = directLight.distance;
   }
 
-  // Return the radiance
-  sampleResult.radiance.xyz = radiance;
-  return sampleResult;
+  return PathStepResult.eOutOfVolume;
 }
 
 //-----------------------------------------------------------------------
+// PATH TRACE
+//
+// This function performs the main path tracing loop. It initializes the path tracer state,
+// traces a ray through the scene, handles intersection and shading logic for the first or subsequent bounces,
+// and updates path tracing state and bounce scratch data accordingly. It manages ray-scene intersections,
+// material retrieval, handling of missed rays (e.g., environment hits),
+// and prepares data for direct/indirect lighting and next events.
+//-----------------------------------------------------------------------
+SampleResult pathTrace(IRaytracer raytracer, RayDesc ray, inout uint seed)
+{
+  PathTracerState pt = {};
+
+  while(pt.surfaceDepth < pushConst.maxDepth)
+  {
+    ray.Direction = normalize(ray.Direction);
+
+    //-----------------------------------------------------------------------
+    // Tracing the ray and finding the radiance, the throughput and the next event valid flag
+    //-----------------------------------------------------------------------
+    BounceScratch  bounce;
+    PathStepResult step = pathTraceOneBounce(raytracer, ray, seed, pt, bounce);
+    if(step == PathStepResult.eBreak)
+      break;
+    if(step == PathStepResult.eVolumeContinue || step == PathStepResult.eEarlyContinue)
+      continue;
+
+    //-----------------------------------------------------------------------
+    // Tracing the shadow ray
+    //-----------------------------------------------------------------------
+    if(bounce.nextEventValid)
+    {
+      RayDesc shadowRay;
+      shadowRay.Origin    = bounce.shadowRayPos;
+      shadowRay.Direction = bounce.shadowRayDir;
+      shadowRay.TMin      = 0.0;
+      shadowRay.TMax      = bounce.shadowRayDist;
+      float3 shadowFactor = raytracer.TraceShadow(shadowRay, seed);
+      pt.radiance += bounce.contribution * shadowFactor;
+    }
+
+    //-----------------------------------------------------------------------
+    // Russian Roulette
+    //-----------------------------------------------------------------------
+    if(pt.surfaceDepth >= RR_MIN_DEPTH)
+    {
+      float rrPcont = min(max(pt.throughput.x, max(pt.throughput.y, pt.throughput.z)) + RR_PCONT_FLOOR, RR_PCONT_CAP);
+      if(rand(seed) >= rrPcont)
+        break;
+      pt.throughput /= rrPcont;
+    }
+
+    // Consume one surface bounce
+    pt.surfaceDepth++;
+  }
+
+#if WIREFRAME
+  if(pt.firstHitWireframeAlpha > 0.0)
+    pt.radiance = lerp(pt.radiance, float3(0.9, 0.0, 0.0), pt.firstHitWireframeAlpha);
+#endif
+
+  return packSampleResult(pt);
+}
+
+
+//-----------------------------------------------------------------------
 // Sampling the pixel
+// This function samples a pixel (trace a path of rays through the scene)
+// and returns the result
 //-----------------------------------------------------------------------
 SampleResult samplePixel(IRaytracer raytracer,
                          inout uint seed,
@@ -718,21 +524,24 @@ SampleResult samplePixel(IRaytracer raytracer,
                          float      focalDist,
                          float      aperture)
 {
-  RayDesc ray = getRay(samplePos, subpixelJitter, imageSize, projMatrixI, viewMatrixI);
+  const bool isOrthographic = hasFlag(pushConst.frameInfo->flags, SceneFrameInfoFlags::eSceneIsOrthographic);
+  RayDesc    ray            = getRay(samplePos, subpixelJitter, imageSize, projMatrixI, viewMatrixI, isOrthographic);
 
-  // Depth-of-Field
-  float3 focalPoint        = focalDist * ray.Direction;
-  float  cam_r1            = rand(seed) * M_TWO_PI;
-  float  cam_r2            = rand(seed) * aperture;
-  float4 cam_right         = mul(viewMatrixI, float4(1, 0, 0, 0));
-  float4 cam_up            = mul(viewMatrixI, float4(0, 1, 0, 0));
-  float3 randomAperturePos = (cos(cam_r1) * cam_right.xyz + sin(cam_r1) * cam_up.xyz) * sqrt(cam_r2);
-  float3 finalRayDir       = normalize(focalPoint - randomAperturePos);
+  // Depth-of-Field (disabled for orthographic cameras)
+  if(!isOrthographic)
+  {
+    float3 focalPoint        = focalDist * ray.Direction;
+    float  cam_r1            = rand(seed) * M_TWO_PI;
+    float  cam_r2            = rand(seed) * aperture;
+    float4 cam_right         = mul(viewMatrixI, float4(1, 0, 0, 0));
+    float4 cam_up            = mul(viewMatrixI, float4(0, 1, 0, 0));
+    float3 randomAperturePos = (cos(cam_r1) * cam_right.xyz + sin(cam_r1) * cam_up.xyz) * sqrt(cam_r2);
+    float3 finalRayDir       = normalize(focalPoint - randomAperturePos);
 
-  // Set the new ray origin and direction with depth-of-field
-  ray.Origin += randomAperturePos;
-  ray.Direction = finalRayDir;
-
+    // Set the new ray origin and direction with depth-of-field
+    ray.Origin += randomAperturePos;
+    ray.Direction = finalRayDir;
+  }
 
   SampleResult sampleResult = pathTrace(raytracer, ray, seed);
 
@@ -746,94 +555,138 @@ SampleResult samplePixel(IRaytracer raytracer,
   return sampleResult;
 }
 
-
 //-----------------------------------------------------------------------
-// Common function for both compute and ray generation shaders
+// Per-pixel accumulation and GBuffer output
 //-----------------------------------------------------------------------
 void processPixel(IRaytracer raytracer, float2 samplePos, float2 imageSize)
 {
+  // Check if the sample position is within the image bounds
   if(samplePos.x >= imageSize.x || samplePos.y >= imageSize.y)
     return;
 
+  // Check if the sample position is the mouse coordinate
   if(samplePos.x == pushConst.mouseCoord.x && samplePos.y == pushConst.mouseCoord.y)
   {
+    // Set the debug flag to true (used for printing debug information)
     doDebug = true;
-  }
-
-  // Shoot a ray to find which element is selected, done only when the object selection changed
-  // or when rendering is re-starting (camera, object moved, .. )
-  if(pushConst.renderSelection == 1 || pushConst.frameCount <= 1)
-  {
-    selectObject(samplePos, imageSize);
   }
 
   // Initialize the random number
   uint seed = xxhash32(uint3(uint2(samplePos.xy), pushConst.frameCount));
 
-  // Subpixel jitter: send the ray through a different position inside the
-  // pixel each time, to provide antialiasing.
+  bool firstFrame = hasFlag(pushConst.flags, PathtracerFlags::ePtFirstFrame);
+
+  // Subpixel jitter: send the ray through a different position inside the pixel each time, to provide antialiasing.
+  // If DLSS is used, the jitter is on the entire frame, not just the pixel.
   float2 subpixelJitter = float2(0.5f, 0.5f);
-  if(pushConst.frameCount > 0)
-    subpixelJitter += ANTIALIASING_STANDARD_DEVIATION * sampleGaussian(float2(rand(seed), rand(seed)));
 
   // #DLSS - use the DLSS jitter and frame index (not resetting to zero)
-  if(pushConst.useDlss == 1)
+  if(hasFlag(pushConst.flags, PathtracerFlags::ePtUseDlss))
   {
-    subpixelJitter = pushConst.jitter + float2(0.5f, 0.5f);
+    subpixelJitter += pushConst.frameInfo.jitter;
+  }
+  else
+  {
+    // Add the jitter to the subpixel jitter
+    subpixelJitter += ANTIALIASING_STANDARD_DEVIATION * sampleGaussian(float2(rand(seed), rand(seed)));
   }
 
   // Sampling n times the pixel
-  SampleResult sampleResult = samplePixel(raytracer, seed, samplePos, subpixelJitter, imageSize, pushConst.frameInfo.projInv,
-                                          pushConst.frameInfo.viewInv, pushConst.focalDistance, pushConst.aperture);
-  float4 pixel_color = sampleResult.radiance;
+  SampleResult sampleResult = samplePixel(raytracer, seed, samplePos, subpixelJitter, imageSize, pushConst.frameInfo->projInv,
+                                          pushConst.frameInfo->viewInv, pushConst.focalDistance, pushConst.aperture);
+  float4 pixelColor = sampleResult.radiance;
+
+  // DLSS uses only one sample per pixel (it does its own temporal accumulation), so the
+  // multi-sample loop is compiled out in the DLSS variant to reduce register pressure.
+  // USE_DLSS_SHADER is true only when DLSS is actually active; for the OptiX and no-denoiser
+  // paths it is 0, so the loop is compiled in and honors the user's samples-per-pixel setting.
+#if !USE_DLSS_SHADER
   for(int s = 1; s < pushConst.numSamples; s++)
   {
     subpixelJitter = float2(rand(seed), rand(seed));
-    sampleResult   = samplePixel(raytracer, seed, samplePos, subpixelJitter, imageSize, pushConst.frameInfo.projInv,
-                                 pushConst.frameInfo.viewInv, pushConst.focalDistance, pushConst.aperture);
-    pixel_color += sampleResult.radiance;
+    sampleResult   = samplePixel(raytracer, seed, samplePos, subpixelJitter, imageSize, pushConst.frameInfo->projInv,
+                                 pushConst.frameInfo->viewInv, pushConst.focalDistance, pushConst.aperture);
+    pixelColor += sampleResult.radiance;
   }
-  pixel_color /= pushConst.numSamples;
+  pixelColor /= pushConst.numSamples;
+#endif  // !USE_DLSS_SHADER
 
-  bool first_frame = (pushConst.frameCount == 0);
+
+  // NDC depth from first-hit world position (Vulkan [0,1] range, 1.0 = far/miss).
+  // Written to two targets: outDepth (main GBuffer, full viewport resolution, frame 0 only)
+  // and eDlssDepth (DLSS guide buffer, DLSS render resolution, every frame when DLSS active).
+  // Both use the same NDC value but the images differ in resolution.
+  const bool hasSolidHit = sampleResult.radiance.w > 0.0f;
+  float4     clipPos =
+      hasSolidHit ? mul(float4(sampleResult.hitPosition, 1.0), pushConst.frameInfo->viewProjMatrix) : float4(0, 0, 1, 1);
+  float ndcDepth = hasSolidHit ? (clipPos.z / clipPos.w) : 1.0f;
+
+  // Only on the first frame, trace the selection ray to get the object IDs and save the NDC depth
+  if(firstFrame)
+  {
+    // Trace the selection ray to get the object IDs
+    uint objectID                                              = traceSelectionRay(raytracer, samplePos, imageSize);
+    outImages[int(OutputImage::eSelectImage)][int2(samplePos)] = float4(asfloat(objectID), 0.0, 0.0, 0.0);
+    outDepth[int2(samplePos)]                                  = ndcDepth;
+  }
 
   // Saving result
-  if(first_frame || (pushConst.useDlss == 1))
+  if(firstFrame || hasFlag(pushConst.flags, PathtracerFlags::ePtUseDlss))
   {  // First frame, replace the value in the buffer
-    outImages[int(OutputImage::eResultImage)][int2(samplePos)] = pixel_color;
+    outImages[int(OutputImage::eResultImage)][int2(samplePos)] = pixelColor;
   }
   else
-  {  // Do accumulation over time
-    float  a                                                   = 1.0F / float(pushConst.frameCount + 1);
-    float4 old_color                                           = outImages[0][int2(samplePos)];
-    outImages[int(OutputImage::eResultImage)][int2(samplePos)] = lerp(old_color, pixel_color, a);
-  }
-
-  // #DLSS - Storing the GBuffer for the DLSS denoiser
-  if(pushConst.useDlss == 1)
   {
-    // Transform world position to view space using inverse view matrix
-    float4 posScreen = mul(float4(sampleResult.dlssOutput.hitPosition, 1.0), pushConst.frameInfo.viewMatrix);
-    float  viewZ = posScreen.z / posScreen.w;  // NOTE: viewZ is the 'Z' of the world hitState position in camera space
-    if(sampleResult.dlssOutput.hitPosition.z >= 1e33f)  // The hit position is invalid (environment), set viewZ to a large value (1.0)
-    {
-      viewZ = 1.0f;
-    }
-
-    float2 motionVec = float2(0);
-    if(sampleResult.dlssOutput.hitPosition.x < 1e33f)
-      motionVec = calculateMotionVector(sampleResult.dlssOutput.hitPosition, pushConst.frameInfo.prevMVP,
-                                        pushConst.frameInfo.viewProjMatrix, imageSize);
-    outImages[int(OutputImage::eDlssDepth)][int2(samplePos)]           = float4(abs(viewZ));
-    outImages[int(OutputImage::eDlssMotion)][int2(samplePos)]          = float4(motionVec, 0, 0);
-    outImages[int(OutputImage::eDlssNormalRoughness)][int2(samplePos)] = sampleResult.dlssOutput.normalRoughness;
-    outImages[int(OutputImage::eDlssAlbedo)][int2(samplePos)]          = sampleResult.dlssOutput.albedo;
-    outImages[int(OutputImage::eDlssSpecAlbedo)][int2(samplePos)] = float4(sampleResult.dlssOutput.specularAlbedo.xyz, 1.0f);
+    // Do accumulation over time using uniform weighting
+    float  totalSamplesAfter = float(pushConst.totalSamples + pushConst.numSamples);
+    float4 old_color         = outImages[0][int2(samplePos)];
+    outImages[int(OutputImage::eResultImage)][int2(samplePos)] =
+        (old_color * pushConst.totalSamples + pixelColor * pushConst.numSamples) / totalSamplesAfter;
   }
+
+#if USE_DLSS_SHADER
+  // #DLSS - Storing the GBuffer for the DLSS denoiser (DLSS-only variant; the specular guide targets
+  // do not exist in the OptiX/no-denoiser build).
+  if(hasFlag(pushConst.flags, PathtracerFlags::ePtUseDlss))
+  {
+    // Combined camera + instance motion. w selects the projection model: surface hits use w=1 (the
+    // previous position carries object motion); sky/background uses w=0, i.e. a point at infinity along
+    // the view direction, so camera translation cancels and only rotation moves the sky (no far-plane
+    // magic). sampleResult.hitPosition holds a world position for surfaces and a view direction for sky.
+    float hitW = hasSolidHit ? 1.0f : 0.0f;
+    float2 motionVec = calculateMotionVector(float4(sampleResult.hitPosition, hitW), float4(sampleResult.hitPositionPrev, hitW),
+                                             pushConst.frameInfo->prevMVP, pushConst.frameInfo->viewProjMatrix, imageSize);
+    outImages[int(OutputImage::eDlssDepth)][int2(samplePos)]           = float4(ndcDepth);
+    outImages[int(OutputImage::eDlssMotion)][int2(samplePos)]          = float4(motionVec, 0, 0);
+    outImages[int(OutputImage::eDlssNormalRoughness)][int2(samplePos)] = sampleResult.guideOutput.normalRoughness;
+    outImages[int(OutputImage::eDlssAlbedo)][int2(samplePos)]          = sampleResult.guideOutput.albedo;
+    outImages[int(OutputImage::eDlssSpecAlbedo)][int2(samplePos)] = float4(sampleResult.guideOutput.specularAlbedo.xyz, 1.0f);
+    outImages[int(OutputImage::eDlssSpecularHitDist)][int2(samplePos)] = float4(sampleResult.guideOutput.specularHitDist);
+  }
+#endif  // USE_DLSS_SHADER
+
+#if USE_GUIDE_SHADER
+  if(hasFlag(pushConst.flags, PathtracerFlags::ePtUseOptixDenoiser))
+  {
+    // Transform normal from world space to camera space for OptiX denoiser
+    // OptiX requires normals in camera space (right-handed, -Z forward, Y up, X right).
+    // On primary misses the guide normal is zero, so fall back to a valid forward-facing
+    // normal to avoid normalizing/compressing a degenerate vector.
+    float3 cameraNormal = float3(0.0f, 0.0f, 1.0f);
+    if(hasSolidHit)
+    {
+      float3 worldNormal = sampleResult.guideOutput.normalRoughness.xyz;
+      cameraNormal       = normalize(mul(float3x3(pushConst.frameInfo->viewMatrix), worldNormal));
+    }
+    uint normalEncoded = compressUnitVec(cameraNormal);
+    outImages[int(OutputImage::eOptixAlbedoNormal)][int2(samplePos)] =
+        float4(sampleResult.guideOutput.albedo.xyz, asfloat(normalEncoded));
+  }
+#endif  // USE_GUIDE_SHADER
 }
 
 //-----------------------------------------------------------------------
-// RAY GENERATION
+// RAY-QUERY COMPUTE
 //-----------------------------------------------------------------------
 [shader("compute")]
 [numthreads(WORKGROUP_SIZE, WORKGROUP_SIZE, 1)]
@@ -866,32 +719,19 @@ void rgenMain()
 [shader("closesthit")]
 void rchitMain(inout HitPayload payload, in BuiltInTriangleIntersectionAttributes attr)
 {
-  float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, attr.barycentrics.x, attr.barycentrics.y);
-
-  int instanceID   = InstanceIndex();
-  int renderPrimID = InstanceID();
-  int primitiveID  = PrimitiveIndex();
-
-  // Get the built-in ray tracing variables
-  float4x3 worldToObject  = WorldToObject4x3();
-  float4x3 objectToWorld  = ObjectToWorld4x3();
-  float3   worldRayOrigin = WorldRayOrigin();
-  float    hitT           = RayTCurrent();
-
-  // Retrieve the Primitive mesh buffer information
-  GltfRenderPrimitive renderPrim = pushConst.gltfScene->renderPrimitives[renderPrimID];
-
-  HitState hit = getHitState(renderPrim, barycentrics, worldToObject, objectToWorld, primitiveID, worldRayOrigin);
-
-  payload.hitT     = hitT;
-  payload.rprimID  = renderPrimID;
-  payload.rnodeID  = instanceID;
-  payload.hitState = hit;
+  payload.hitT        = RayTCurrent();
+  payload.rprimID     = InstanceID();
+  payload.rnodeID     = InstanceIndex();
+  payload.primitiveID = PrimitiveIndex();
+  payload.bary        = attr.barycentrics;
 }
 
 [shader("closesthit")]
 void rchitShadow(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attr)
 {
+  // When we reach the closest hit for shadow rays, it means we've accepted a hit
+  // in rahitShadow due to low transmission. The transmission has already been
+  // processed in rahitShadow, so we just ensure it's set to fully occluded.
   payload.totalTransmission = float3(0.0);
 }
 
@@ -908,27 +748,33 @@ void rmissMain(inout HitPayload payload)
 [shader("miss")]
 void rmissShadow(inout ShadowPayload payload)
 {
-  payload.hitT              = INFINITE;
-  payload.totalTransmission = float3(1.0);
+  // When we miss, we've passed through all surfaces along the ray.
+  // Keep the accumulated transmission -- don't reset it. totalTransmission already contains
+  // the accumulated value from rahitShadow.
 }
 
 //-----------------------------------------------------------------------
 // INTERSECTION (Any Hit)
 //-----------------------------------------------------------------------
-
 [shader("anyhit")]
 void rahitMain(inout HitPayload payload, in BuiltInTriangleIntersectionAttributes attr)
 {
+#if USE_VISUALIZE
+  // Opacity-micromap debug view: any-hit only runs for "unknown" micro-triangles (OMM-opaque
+  // ones are committed by the hardware without any-hit, transparent ones are culled). Flag it and
+  // accept the hit so it is colored as unknown; the path breaks at the first hit anyway.
+  if(pushConst.frameInfo->visualization == Visualization::eOpacityMicromap)
+  {
+    payload.ommUnknown = true;
+    AcceptHitAndEndSearch();
+  }
+#endif
+
   float3 barycentrics = float3(1 - attr.barycentrics.x - attr.barycentrics.y, attr.barycentrics.x, attr.barycentrics.y);
 
   uint instanceID   = InstanceIndex();
   uint renderPrimID = InstanceID();
   uint triangleID   = PrimitiveIndex();
-
-  // Get the built-in ray tracing variables
-  float3x4 worldToObject = WorldToObject3x4();
-  float3   worldRayDir   = WorldRayDirection();
-  float    hitT          = RayTCurrent();
 
   // Retrieve the Primitive mesh buffer information
   GltfRenderNode      renderNode = pushConst.gltfScene->renderNodes[instanceID];
@@ -964,12 +810,18 @@ void rahitShadow(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttr
   float r       = rand(payload.seed);
   if(r < opacity)
   {
-    float  currentHitT  = abs(hitT - payload.hitT);
+    // Segment length for Beer's law inside getShadowTransmission (only used when isInside == true).
+    // abs() guards against any-hit invocations arriving out of spatial order, which Vulkan/DXR
+    // do not guarantee. This is an approximation; a fully correct version would chain
+    // closest-hit traces along the ray instead of accumulating in any-hit.
+    float segmentLength = abs(hitT - payload.prevHitT);
+
     bool   isInside     = payload.isInside;
-    float3 transmission = getShadowTransmission(renderNode, renderPrim, primitiveID, barycentrics, currentHitT,
+    float3 transmission = getShadowTransmission(renderNode, renderPrim, primitiveID, barycentrics, segmentLength,
                                                 worldToObject, worldRayDir, isInside);
 
     payload.isInside = isInside;
+    payload.prevHitT = hitT;  // keep the actual previous hit T, not the segment length
     payload.totalTransmission *= transmission;
 
     if(max(max(payload.totalTransmission.r, payload.totalTransmission.g), payload.totalTransmission.b) <= MIN_TRANSMISSION)

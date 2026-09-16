@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,28 +13,27 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/**
- * Core resource management header for the Vulkan GLTF renderer.
- * 
- * This header defines the main resource structures and settings for a Vulkan-based 3D renderer
- * that supports both path tracing and rasterization. It manages Vulkan resources, GLTF scene data,
- * environment maps, and rendering settings.
- */
+// Core resource management header for the Vulkan glTF renderer.
+//
+// Defines the main resource structures and settings for a Vulkan-based 3D renderer
+// that supports both path tracing and rasterization. Manages Vulkan resources, glTF scene data,
+// environment maps, and rendering settings.
 
 #pragma once
+#include <algorithm>
 #include <bitset>
+#include <cstdint>
+#include <memory>
+#include <unordered_set>
 
 #include <glm/glm.hpp>
 #include <glm/ext/scalar_constants.hpp>
 
-namespace shaderio {
-using namespace glm;
 #include "shaders/shaderio.h"  // Shared between host and device
-}  // namespace shaderio
 
 #include <nvgui/sky.hpp>
 #include <nvshaders_host/hdr_env_dome.hpp>
@@ -42,13 +41,21 @@ using namespace glm;
 #include <nvslang/slang.hpp>
 #include <nvutils/camera_manipulator.hpp>
 #include <nvvk/descriptors.hpp>
-#include <nvvk/gbuffers.hpp>
+#include <nvvk/render_target.hpp>
 #include <nvvk/hdr_ibl.hpp>
 #include <nvvk/resource_allocator.hpp>
 #include <nvvk/sampler_pool.hpp>
-#include <nvvkgltf/scene.hpp>
-#include <nvvkgltf/scene_rtx.hpp>
-#include <nvvkgltf/scene_vk.hpp>
+#include <nvvk/staging.hpp>
+#include "gltf_scene.hpp"
+#include "gltf_scene_gpu.hpp"
+#include "ui_animation.hpp"
+#include "ui_interactivity.hpp"
+#include "gltf_scene_transform_vk.hpp"
+#include "gpu_memory_tracker.hpp"
+#include "scene_feature_detection.hpp"
+#include <nvapp/application.hpp>
+#include <nvapp/imgui_texture.hpp>
+
 
 enum class RenderingMode
 {
@@ -56,71 +63,159 @@ enum class RenderingMode
   eRasterizer
 };
 
+// Which special view the user wants in the viewport. The DLSS guide-buffer entries that used
+// to live here are gone -- DLSS guide selection is now encapsulated inside the Dlss class
+// (see Dlss::activeGuideImage() in dlss.hpp). What remains are only the two app-level overrides
+// of the rendered output: the regular renderer output, or the OptiX denoised image.
+enum class DisplayBuffer
+{
+  eRendered,           // Final rendered image (default)
+  eOptixDenoised,      // OptiX Denoised output (handled via OptiXDenoiser::getDescriptorImageInfo)
+  eAgenticBeautified,  // External image-to-image result from the agentic bridge
+};
+
 enum DirtyFlags
 {
-  eVulkanScene,       // When the Vulkan geometry buffers need to be updated
-  eVulkanMaterial,    // When the Vulkan material buffers need to be updated
-  eVulkanAttributes,  // When the Vulkan attributes need to be updated
-  eRtxScene,          // When the RTX acceleration structures need to be updated
-  eHdrEnv,            // When the HDR environment needs to be updated
-  eNodeVisibility,    // When the node visibility has changed
+  eDirtyTangents,  // When tangents need to be pushed to GPU
 
   eNumDirtyFlags  // Keep last - Number of dirty flags
 };
 
 struct Settings
 {
-  RenderingMode         renderSystem           = RenderingMode::ePathtracer;    // Renderer to use
-  shaderio::DebugMethod debugMethod            = shaderio::DebugMethod::eNone;  // Debug method for the rasterizer
-  shaderio::EnvSystem   envSystem              = shaderio::EnvSystem::eSky;     // Environment system: Sky or HDR
-  bool                  showAxis               = true;                          // Show the axis (bottom left)
-  float                 hdrEnvIntensity        = 1.0f;                          // Intensity of the environment (HDR)
-  float                 hdrEnvRotation         = 0.0f;                          // Rotation of the environment (HDR)
-  float                 hdrBlur                = 0.0f;                          // Blur of the environment (HDR)
-  glm::vec3             silhouetteColor        = {0.6f, 0.4f, 0.0f};            // Color of the silhouette
-  bool                  useSolidBackground     = false;                         // Use solid background color
-  glm::vec3             solidBackgroundColor   = {0.0f, 0.0f, 0.0f};            // Solid background color
-  int                   maxFrames              = {10000};                       // Maximum number of frames to render
-  bool                  useInfinitePlane       = false;
-  float                 infinitePlaneDistance  = 0;
-  glm::vec3             infinitePlaneBaseColor = glm::vec3(0.5, 0.5, 0.5);  // Default gray color
-  float                 infinitePlaneMetallic  = 0.0;                       // Default non-metallic
-  float                 infinitePlaneRoughness = 0.5;                       // Default medium roughness
+  RenderingMode           renderSystem           = RenderingMode::ePathtracer;          // Renderer to use
+  shaderio::Visualization visualization          = shaderio::Visualization::eRendered;  // Visualization mode
+  bool                    wireframe              = false;                      // Wireframe overlay on rendered meshes
+  shaderio::EnvSystem     envSystem              = shaderio::EnvSystem::eSky;  // Environment system: Sky or HDR
+  bool                    showAxis               = true;                       // Show the axis (bottom left)
+  bool                    showGrid               = false;                      // Show infinite grid
+  bool                    showGizmo              = false;                      // Show transform gizmo on selected node
+  bool                    snapEnabled            = false;  // Snap gizmo transforms to grid increments
+  float                   gridUnit               = 1.0f;   // Grid base unit (world units)
+  float                   snapRotation           = 45.0f;  // Rotation snap increment (degrees)
+  float                   snapScale              = 0.1f;   // Scale snap increment
+  bool                    showMemStats           = false;  // Show memory statistics window
+  bool                    showCameraWindow       = true;   // Show Camera window
+  bool                    showSettingsWindow     = true;   // Show Settings window
+  bool                    showEnvironmentWindow  = true;   // Show Environment window
+  bool                    showTonemapperWindow   = true;   // Show Tonemapper window
+  bool                    showStatisticsWindow   = false;  // Show Statistics window
+  bool                    showSceneBrowserWindow = true;   // Show Scene Browser window
+  bool                    showInspectorWindow    = true;   // Show Inspector window
+  bool      showInteractivityWindow = false;  // Show KHR_interactivity Graphs window (opt-in, unlike the above)
+  bool      showAgenticWindow       = false;  // Show Agentic bridge window
+  bool      showGridSettingsWindow  = false;  // Show Grid & Snap settings window
+  float     hdrEnvIntensity         = 1.0f;   // Intensity of the environment (HDR)
+  float     hdrEnvRotation          = 0.0f;   // Rotation of the environment (HDR)
+  float     hdrBlur                 = 0.0f;   // Blur of the environment (HDR)
+  glm::vec3 silhouetteColor         = {0.933f, 0.580f, 0.180f};  // Color of the silhouette
+  bool      useSolidBackground      = false;                     // Use solid background color
+  glm::vec3 solidBackgroundColor    = {0.0f, 0.0f, 0.0f};        // Solid background color
+  int       maxFrames               = {500};                     // Maximum number of frames to render
+  bool      useInfinitePlane        = false;                     // Use infinite plane
+  bool      isShadowCatcher         = true;                      // Infinite place only catch shadow
+  float     infinitePlaneDistance   = 0;                         // Distance/height of the infinite plane
+  glm::vec3 infinitePlaneBaseColor  = glm::vec3(0.5, 0.5, 0.5);  // Default gray color
+  float     infinitePlaneMetallic   = 0.0;                       // Default non-metallic
+  float     infinitePlaneRoughness  = 0.5;                       // Default medium roughness
+  float     shadowCatcherDarkness   = 0.0f;                      // Non-physical shadow darkening
+  bool      dlssRrHardwareAvailable = false;  // DLSS Ray Reconstruction hardware/extensions available (set at startup)
+  bool dlssSrHardwareAvailable = false;  // DLSS Super Resolution / DLAA hardware/extensions available (set at startup)
+  bool opacityMicromapSupported = false;  // VK_EXT_opacity_micromap available (set at startup); gates EXT_mesh_opacity_micromap
+  DisplayBuffer displayBuffer = DisplayBuffer::eRendered;  // Which buffer to display in viewport
+
+  // Enable scene-based shader optimization. When true, only features used by the scene are
+  // enabled, reducing shader size and register usage at the cost of a one-time recompile per scene change.
+  bool optimalShader = false;
+
+#ifndef NDEBUG
+  bool showGridStyleWindow  = false;  // Show Grid Style debug window
+  bool showGizmoStyleWindow = false;  // Show Gizmo Style debug window
+#endif
 };
 
 
+// StagingUploader with per-frame timeline semaphore tracking.
+// Overrides acquireStagingSpace so that all staging operations automatically
+// get the current frame's semaphore state, enabling releaseStaging() to free
+// resources only after the GPU has finished using them.
+class FrameStagingUploader : public nvvk::StagingUploader
+{
+public:
+  // Release completed staging resources and update the timeline semaphore
+  // for the new frame. Must be called once per frame before any staging uploads.
+  void beginFrame(const nvvk::SemaphoreInfo& frameSem)
+  {
+    releaseStaging();
+    m_timelineSemaphore = frameSem.semaphore;
+    m_timelineValue     = frameSem.value;
+  }
+
+  // Acquire staging space with the current frame's timeline semaphore and value
+  VkResult acquireStagingSpace(nvvk::BufferRange&          stagingSpace,
+                               size_t                      dataSize,
+                               const void*                 data,
+                               const nvvk::SemaphoreState& semaphoreState = {}) override
+  {
+    if(!semaphoreState.isValid() && m_timelineSemaphore != VK_NULL_HANDLE)
+      return StagingUploader::acquireStagingSpace(stagingSpace, dataSize, data,
+                                                  nvvk::SemaphoreState::makeFixed(m_timelineSemaphore, m_timelineValue));
+    return StagingUploader::acquireStagingSpace(stagingSpace, dataSize, data, semaphoreState);
+  }
+
+private:
+  VkSemaphore m_timelineSemaphore = VK_NULL_HANDLE;
+  uint64_t    m_timelineValue     = 0;
+};
+
 struct Resources
 {
-  enum
+  enum ImageType
   {
     eImgTonemapped,
     eImgRendered,
     eImgSelection,
+    eImgCount,  // Sentinel: number of frame-target color attachments. KEEP LAST.
   };
+
+  nvapp::Application* app{nullptr};
 
   VkInstance              instance{};
   nvvk::ResourceAllocator allocator{};  // Vulkan Memory Allocator
-  nvvk::StagingUploader   staging;
+  FrameStagingUploader    staging;
 
   nvvk::SamplerPool      samplerPool{};    // Texture Sampler Pool
   VkCommandPool          commandPool{};    // Command pool for secondary command buffer
   nvslang::SlangCompiler slangCompiler{};  // Slang compiler
 
-  // Scene
-  nvvkgltf::Scene    scene;     // GLTF Scene
-  nvvkgltf::SceneVk  sceneVk;   // GLTF Scene buffers
-  nvvkgltf::SceneRtx sceneRtx;  // GLTF Scene BLAS/TLAS
+  std::unique_ptr<nvvkgltf::Scene> scene;
+  nvvkgltf::SceneVk                sceneVk;
+  nvvkgltf::SceneRtx               sceneRtx;
+  nvvkgltf::AnimationVk            animationVk;
+  nvvkgltf::TransformComputeVk     transformCompute{};
+  nvvkgltf::SceneGpu sceneGpu{sceneVk, animationVk, sceneRtx, transformCompute, staging};  // Must be declared after its reference dependencies
+
+  nvvkgltf::Scene*       getScene() { return scene.get(); }
+  const nvvkgltf::Scene* getScene() const { return scene.get(); }
 
   // Resources
-  nvvk::HdrIbl                                hdrIbl;  // HDR environment map
-  nvshaders::HdrEnvDome                       hdrDome;
-  nvvk::GBuffer                               gBuffers;          // G-Buffers: color + depth
-  nvvk::Buffer                                bFrameInfo;        // Scene/Frame information
-  nvvk::Buffer                                bSkyParams;        // Sky parameters
-  shaderio::SkyPhysicalParameters             skyParams{};       // Sky parameters
-  nvshaders::Tonemapper                       tonemapper{};      // Tonemapper
-  shaderio::TonemapperData                    tonemapperData{};  // Tonemapper data
-  std::shared_ptr<nvutils::CameraManipulator> cameraManip;       // Camera manipulator
+  nvvk::HdrIbl          hdrIbl;  // HDR environment map
+  nvshaders::HdrEnvDome hdrDome;
+  // Main frame target (tonemapped + rendered + selection + depth). Accessor cheat sheet:
+  //   raster attachment  -> getColorAttachmentView() / getDepthImageView()
+  //   compute write      -> getColorStorageImageInfo()
+  //   sampled read       -> getColorSampleDescriptorImageInfo(..., linearSampler)
+  //   ImGui              -> getUiImageView() + tonemappedUi
+  nvvk::RenderTarget                          gBuffers;
+  nvapp::ImTexture                            tonemappedUi{};   // Viewport display (eImgTonemapped only)
+  VkSampler                                   linearSampler{};  // Linear sampler (visual helpers, etc.)
+  nvvk::Buffer                                bFrameInfo;       // Scene/Frame information
+  nvvk::Buffer                                bSkyParams;       // Sky parameters
+  shaderio::SkyPhysicalParameters             skyParams{};      // Sky parameters
+  nvshaders::Tonemapper                       tonemapper{};     // Tonemapper
+  shaderio::TonemapperData                    tonemapperData{.autoExposure = 1};  // Tonemapper data
+  std::shared_ptr<nvutils::CameraManipulator> cameraManip;         // Camera manipulator (owned by GltfRenderer)
+  std::filesystem::path                       headlessOutputPath;  // --output: override for headless image save path
 
   // Pipeline
   std::array<nvvk::DescriptorBindings, 2> descriptorBinding{};    // Descriptor bindings: 0: textures, 1: tlas
@@ -128,11 +223,69 @@ struct Resources
   VkDescriptorSet                         descriptorSet{};        // Descriptor set for the textures
   VkDescriptorPool                        descriptorPool{};
 
+  // Animation playback state
+  AnimationControl animationControl{};
+
+  // KHR_interactivity Graphs panel playback state
+  InteractivityControl interactivityControl{};
 
   int frameCount{0};
-  int selectedObject{-1};  // Selected object in the scene
+
+  // Monotonic count of completed onRender() calls since the app started - unlike frameCount above
+  // (which resets to -1 on every dirty-flag/camera-move reset, by design, to avoid ghosting), this
+  // never resets. A KHR_interactivity graph that writes a pointer every tick (e.g. a permanent idle
+  // animation via event/onTick) resets frameCount every single frame, so it can never reach >= 1 -
+  // callers that just need "has at least one frame actually rendered" (e.g. a UI scenario script's
+  // ready gate) should use this instead.
+  uint64_t renderPassCount{0};
+
+  // #DLSS: True if any node transforms changed this frame (for DLSS per-instance motion).
+  bool dlssInstanceMotionActive{false};
+
+  // Selection: set of render node indices (TLAS order). One primitive = set of size 1; node + branch = many.
+  std::unordered_set<int> selectedRenderNodes;
+
+  // Selection bitmask for silhouette: one bit per render node (GPU buffer + CPU mirror)
+  std::vector<uint32_t> selectionBitMask;
+  nvvk::Buffer          bSelectionBitMask;
+  bool                  selectionDirty = true;
+
+  // Build CPU-side selection bitmask from selectedRenderNodes. Cleared and refilled each call.
+  void updateSelectionBitMask(int numRenderNodes)
+  {
+    const size_t numWords = numRenderNodes > 0 ? (static_cast<size_t>(numRenderNodes) + 31u) / 32u : 1u;
+    selectionBitMask.resize(numWords, 0u);
+    std::fill(selectionBitMask.begin(), selectionBitMask.end(), 0u);
+    for(int rnIdx : selectedRenderNodes)
+    {
+      if(rnIdx >= 0 && static_cast<size_t>(rnIdx) < numRenderNodes)
+      {
+        const size_t word = static_cast<size_t>(rnIdx) / 32u;
+        const size_t bit  = static_cast<size_t>(rnIdx) % 32u;
+        selectionBitMask[word] |= (1u << bit);
+      }
+    }
+  }
+
+  nvvkgltf::GpuMemoryTracker appMemoryTracker;  // Application-level GPU memory tracking (frame targets, denoisers, etc.)
 
   Settings settings;
 
   std::bitset<32> dirtyFlags;
+
+  // Scene feature set (KHR_materials_* and denoiser guide buffer);
+  // updated via recomputeSceneFeatures() on scene/material/denoiser changes.
+  nvvkgltf::SceneFeatureSet currentFeatureSet{};
+
+  // Update currentFeatureSet from the scene. Returns true if changed.
+  bool recomputeSceneFeatures(bool dlssGuideActive)
+  {
+    nvvkgltf::SceneFeatureSet newSet{};
+    if(scene)
+      newSet = nvvkgltf::detectSceneFeatures(scene->getModel());
+    newSet.set(nvvkgltf::SceneFeatureSet::eDlssGuide, dlssGuideActive);
+    const bool changed = (newSet != currentFeatureSet);
+    currentFeatureSet  = newSet;
+    return changed;
+  }
 };

@@ -1,439 +1,229 @@
-# Vulkan glTF Scene Renderer
+# Vulkan RTX Path Tracer — glTF Scene Editor & PBR Material Reference
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-green.svg)](#requirements)
+[![C++](https://img.shields.io/badge/C%2B%2B-20-orange.svg)](#build-and-run)
+[![Vulkan](https://img.shields.io/badge/Vulkan-1.4%2B-red.svg)](#requirements)
 
-|Pathtracer | Raster|
-|:------------: | :------------: |
-|![](doc/pathtrace.png) |![](doc/raster.png)|
+> Open-source **Vulkan RTX path tracer** and **PBR material reference** for **glTF 2.0** — with a built-in **glTF scene editor** for non-destructive hierarchy manipulation, material authoring, and save-back to glTF; AI denoising, and support for 34+ glTF extensions.
 
-## Overview
+| Vulkan RTX Path Tracer & glTF Scene Editor |
+|---|
+| ![](docs/images/gltf_renderer.jpg) |
 
-This application demonstrates a dual-mode renderer for glTF 2.0 scenes, implementing both ray tracing and rasterization pipelines. It showcases the utilization of shared Vulkan resources across rendering modes, including geometry, materials, and textures.
+A production-quality **Vulkan ray tracing** renderer and **glTF PBR material reference** for **glTF 2.0** scenes. Comes with a built-in **glTF scene editor** — edit scene hierarchies, author PBR materials, apply transforms with a gizmo, and save back to glTF — backed by a high-fidelity **RTX path tracer** with **DLSS Ray Reconstruction** and **OptiX AI Denoiser**. Built for graphics developers who want a reference they can study, profile, and extend.
 
-## What's New
+Built in C++ on [nvpro_core2](https://github.com/nvpro-samples/nvpro_core2) with [Slang](https://github.com/shader-slang/slang) shaders. Successor to [vk_raytrace](https://github.com/nvpro-samples/vk_raytrace).
 
-This version brings significant improvements and modernization:
+## Highlights
 
-- **Modern Vulkan Framework**: Now using [Nvpro-Core2](https://github.com/nvpro-samples/nvpro_core2.git) which provides:
-  - Vulkan 1.4 support
-  - Volk for dynamic Vulkan loading
-  - Modern C++ features and improved architecture
-  - Enhanced debugging and validation layers
-  - Better resource management
+- **glTF scene editor** — Non-destructive scene authoring: hierarchy manipulation, transform gizmo, node/material/light editing, undo/redo, and save back to glTF without touching the original assets.
+- **glTF PBR material reference** — Monte Carlo path tracer with NEE, MIS, and adaptive sampling for physically accurate glTF PBR material evaluation.
+- **34 glTF extensions** — Anisotropy, clearcoat, transmission, volume, sheen, iridescence, dispersion, retroreflection, Draco, interactivity, opacity micromaps, and more.
+- **glTF 2.1 complex scenes (preview)** — Compose multi-file scenes with External Assets: reference glTF/GLB files as instances that share geometry, with nested references, cycle detection, and file aliases — re-externalized on save.
+- **AI denoising** — DLSS Ray Reconstruction and OptiX AI Denoiser produce clean images at interactive rates.
+- **Agentic AI generation (optional)** — Local **ComfyUI** bridge that *beautifies* the current render or *generates an HDRI* environment from a text prompt.
+- **Rasterizer preview** — Fast PBR rasterizer shares scene resources for instant iteration during editing.
+- **Developer tools** — GPU profiler, memory tracker, shader hot-reload (Ctrl+Shift+R), headless batch mode.
 
-- **Slang Shading Language**: Replaced GLSL with [Slang](https://github.com/shader-slang/slang) for:
-  - Enhanced shader development experience
-  - Better cross-platform compatibility
-  - Improved shader debugging capabilities
-  - Hot-reloading support (F5)
-  - Modern shader language features
+## Quick Tour
 
-- **DLSS-RR Denoiser**: Added support for NVIDIA's DLSS Ray Reconstruction denoiser (optional, enable with `USE_DLSS`).
+![](docs/images/hero_demo.gif)
 
-## Key Features
+The demo shows a short end-to-end workflow: switching renderer modes, tuning settings, and inspecting scene content in the integrated editor.
 
-- glTF 2.0 (.gltf/.glb) scene loading
-- Pathtracing with global illumination
-- PBR-based rasterization
-- HDR environment mapping and Sun & Sky simulation
-- Advanced tone mapping
-- Camera control system
-- Extensive debug visualization options
+## Build and Run
 
-## Dependencies
+### Requirements
 
- - Vulkan SDK ([latest version](https://vulkan.lunarg.com/sdk/home))
- - [Nvpro-Core2](https://github.com/nvpro-samples/nvpro_core2.git) framework
- - [Slang](https://github.com/shader-slang/slang) shading language (included with nvpro_core2)
+| Requirement | Minimum | Recommended |
+|---|---|---|
+| **OS** | Windows 10 / Linux | Windows 11 / Ubuntu 22.04+ |
+| **GPU** | NVIDIA RTX 20-series (Turing) | NVIDIA RTX 40-series (Ada) |
+| **Driver** | 535+ | Latest Game Ready / Studio |
+| **CMake** | 3.22 | 3.28+ |
+| **C++ Compiler** | C++20 (MSVC 2022 / GCC 12 / Clang 15) | MSVC 2022 17.8+ |
+| **Vulkan SDK** | 1.4 | [Latest](https://vulkan.lunarg.com/sdk/home) |
 
-## Build Instructions
+### Quick start
 
-1. Clone the repositories
 ```bash
+# Clone (recommended: siblings; CMake auto-downloads nvpro_core2 if missing)
 git clone https://github.com/nvpro-samples/nvpro_core2.git
 git clone https://github.com/nvpro-samples/vk_gltf_renderer.git
-```
-
-2. Build the project
-```bash
 cd vk_gltf_renderer
-mkdir build
-cd build
-cmake ..
-cmake --build . --config release
 ```
-
-3. Run the application
-```bash
-.\bin_x64\Release\vk_gltf_renderer.exe
-```
-
-4. Install [optional] : if you want to package the application
-``` bash
-cmake --install .
-```
-
-### Draco Compression
-
-To enable Draco mesh compression, you need to enable the option CMake. In the GUI interface, you will see the option `USE_DRACO`. If you are using the command line, you can add `-DUSE_DRACO=ON` to the cmake command. This will download the Draco library and it will be included in the project.
-
-### DLSS Ray Reconstruction Denoiser
-
-This release adds support for NVIDIA's [**DLSS Ray Reconstruction (DLSS-RR)**](https://developer.nvidia.com/rtx/dlss) denoiser. DLSS-RR provides state-of-the-art AI-based denoising for path-traced images, significantly improving image quality and temporal stability.
-
-**How to enable:**
-
-By default, DLSS-RR is **disabled**. To enable it, set the CMake option `USE_DLSS=ON` when configuring the project:
 
 ```bash
-cmake -DUSE_DLSS=ON ..
+# Windows
+cmake -B build -S . -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+.\_bin\Release\vk_gltf_renderer.exe
 ```
 
-This will automatically download and integrate the required DLSS SDK. The denoiser will then be available as an option in the renderer.
+```bash
+# Linux
+cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./_bin/Release/vk_gltf_renderer
+```
 
-> **Note:** DLSS-RR requires a compatible NVIDIA GPU and drivers.
+### Common CMake options
 
-
-## glTF Core features
-
-- [x] glTF 2.0 (.gltf/.glb)
-- [x] images (HDR, PNG, JPEG, ...)
-- [x] buffers (geometry, animation, skinning, ...)
-- [x] textures (base color, normal, metallic, roughness, ...)
-- [x] materials (PBR, ...)
-- [x] animations
-- [x] skins
-- [x] morphs
-- [x] cameras
-- [x] lights
-- [x] nodes
-- [x] scenes
-- [x] samplers
-- [x] textures
-- [x] extensions
-
-## GLTF Extensions
- Here are the list of extensions that are supported by this application
-
-- [ ] KHR_animation_pointer
-- [x] KHR_draco_mesh_compression
-- [x] KHR_lights_punctual
-- [x] KHR_materials_anisotropy
-- [x] KHR_materials_clearcoat
-- [x] KHR_materials_diffuse_transmission
-- [x] KHR_materials_dispersion
-- [x] KHR_materials_emissive_strength
-- [x] KHR_materials_ior
-- [x] KHR_materials_iridescence
-- [x] KHR_materials_sheen
-- [x] KHR_materials_specular
-- [x] KHR_materials_transmission
-- [x] KHR_materials_unlit
-- [x] KHR_materials_variants
-- [x] KHR_materials_volume
-- [ ] KHR_mesh_quantization
-- [x] KHR_texture_basisu
-- [x] KHR_texture_transform
-- [ ] KHR_xmp_json_ld
-- [x] EXT_mesh_gpu_instancing
-- [x] KHR_node_visibility
-
-## Pathtracer
-
-Implements a path tracer with global illumination. 
-
-
-![](doc/pathtracer_settings.png)
-
-The options are:
-* Max Depth : number of bounces the path can do
-* Max Samples: how many samples per pixel at each frame iteration
-* Aperture: depth-of-field
-* Debug Method: shows information like base color, metallic, roughness, and some attributes
-* Choice between indirect and RTX pipeline.
-* Denoiser: A-trous denoiser 
-
-
-## Raster
-
-Utilizes shared Vulkan resources with the path tracer, including:
-
-- Scene geometry
-- Material data
-- Textures
-- Shading functions
-
-The options are:
-* Show wireframe: display wireframe on top of the geometry
-* Super-Sampling: render the image 2x and blit it with linear filter.
-* Debug Method: shows information like base color, metallic, roughness, and some attributes
-
-![](doc/raster_settings.png)
-
-Example with wireframe option turned on
-
-![](doc/wireframe.png)
-
+| Option | Default | Description |
+|---|---|---|
+| `USE_DLSS` | `ON` | Enable DLSS Ray Reconstruction integration |
+| `USE_OPTIX_DENOISER` | `ON` | Enable OptiX AI Denoiser (requires CUDA Toolkit) |
+| `USE_DRACO` | `ON` | Enable Draco mesh compression support |
+| `BUILD_TESTING` | `OFF` | Build unit tests and benchmarks |
 
 ## Features
 
-| | | 
-|--|--|
-| Showcase | ![](doc/ABeautifulGame.jpg) ![](doc/ToyCar.jpg) ![](doc/DamagedHelmet.jpg) ![](doc/DiffuseTransmissionPlant.jpg) <br> ![](doc/DiffuseTransmissionTeacup.jpg) ![](doc/AntiqueCamera.jpg)  ![](doc/BistroExterior.jpg) ![](doc/IridescentDishWithOlives.jpg) <br> ![](doc/SpecularSilkPouf.jpg) ![](doc/Sponza.jpg) ![](doc/SciFiHelmet.jpg) ![](doc/ChairDamaskPurplegold.jpg) <br> ![](doc/CarConcept.jpg) ![](doc/SunglassesKhronos.jpg)|
-| Anisotropy | ![](doc/AnisotropyBarnLamp.jpg) ![](doc/AnisotropyDiscTest.jpg) ![](doc/AnisotropyRotationTest.jpg) ![](doc/AnisotropyStrengthTest.jpg) <br> ![](doc/CompareAnisotropy.jpg)|
-| Attenuation | ![](doc/DragonAttenuation.jpg) ![](doc/AttenuationTest.jpg)|
-| Alpha Blend | ![](doc/AlphaBlendModeTest.jpg) ![](doc/CompareAlphaCoverage.jpg) |
-| Animation | ![](doc/BrainStem.jpg) ![](doc/CesiumMan.jpg) ![](doc/Fox.jpg) |
-| Clear Coat | ![](doc/ClearCoatCarPaint.jpg) ![](doc/ClearCoatTest.jpg) ![](doc/ClearcoatWicker.jpg) ![](doc/CompareClearcoat.jpg)
-| Dispersion | ![](doc/DispersionTest.jpg) ![](doc/DragonDispersion.jpg) ![](doc/CompareDispersion.jpg) |
-| IOR | ![](doc/IORTestGrid.jpg) ![](doc/CompareIor.jpg) |
-| Emissive |![](doc/EmissiveStrengthTest.jpg) ![](doc/CompareEmissiveStrength.jpg) |
-| Iridescence | ![](doc/IridescenceAbalone.jpg) ![](doc/IridescenceDielectricSpheres.jpg) ![](doc/IridescenceLamp.jpg) ![](doc/IridescenceSuzanne.jpg) |
-| Punctual | ![](doc/LightsPunctualLamp.jpg) ![](doc/light.jpg) |
-| Sheen | ![](doc/SheenChair.jpg) ![](doc/SheenCloth.jpg) ![](doc/SheenTestGrid.jpg) ![](doc/CompareSheen.jpg) |
-| Transmission | ![](doc/TransmissionRoughnessTest.jpg) ![](doc/TransmissionTest.jpg) ![](doc/TransmissionThinwallTestGrid.jpg) ![](doc/CompareTransmission.jpg) <br> ![](doc/CompareVolume.jpg) ![](doc/GlassBrokenWindow.jpg) ![](doc/MosquitoInAmber.jpg) |
-| Variant | ![](doc/MaterialsVariantsShoe_1.jpg) ![](doc/MaterialsVariantsShoe_2.jpg) ![](doc/MaterialsVariantsShoe_3.jpg) |
-| Others | ![](doc/BoxVertexColors.jpg) ![](doc/Duck.jpg) ![](doc/MandarinOrange.jpg) ![](doc/SpecularTest.jpg) ![](doc/OrientationTest.jpg) ![](doc/NegativeScaleTest.jpg) ![](doc/NormalTangentTest.jpg) ![](doc/TextureCoordinateTest.jpg) ![](doc/NormalTangentMirrorTest.jpg)  ![](doc/BarramundiFish.jpg) ![](doc/CarbonFibre.jpg) ![](doc/cornellBox.jpg) ![](doc/GlamVelvetSofa_1.jpg)  ![](doc/LightsPunctualLamp.jpg) ![](doc/MultiUVTest.jpg) ![](doc/SimpleInstancing.jpg) ![](doc/SpecGlossVsMetalRough.jpg) ![](doc/CompareBaseColor.jpg) ![](doc/CompareMetallic.jpg) ![](doc/CompareSpecular.jpg) |
+- **Ray tracing**: High-quality path tracing reference for glTF PBR materials — Monte Carlo global illumination, next event estimation, multiple importance sampling, and adaptive sampling.
+- Profiler, GPU monitor, GPU memory tracking, and statistics.
+- Shader hot-reload (Ctrl+Shift+R) for developers who want to experiment.
+- AI denoisers: DLSS Ray Reconstruction and OptiX AI Denoiser.
+- Optional agentic AI generation via a local ComfyUI bridge: beautify the current render, or generate an HDRI environment from a text prompt (see [ComfyUI Agentic Setup](docs/comfyui-agentic-setup.md)).
+- Rasterizer fallback for fast scene interaction and editing.
+- A scene asset editor with hierarchy operations, a transform gizmo, material editing, merging, and saving back to glTF (non-destructive).
+- glTF 2.1 complex-scene composition (preview): reference external glTF/GLB assets, instance them (shared geometry), resolve nested references with cycle detection, and re-externalize on save.
+- Support for 34 glTF extensions, including anisotropy, clearcoat, transmission, volume, sheen, iridescence, dispersion, diffuse transmission, retroreflection, opacity micromaps, material variant, scattering, and interactivity (behavior graphs).
+- HDR environments, a physical sun and sky model, depth of field, and multiple tone mappers.
+- Animation support includes skeletal, morph targets, and KHR_animation_pointer.
+- GPU compute accelerates both skinning/morphing and per-level world-matrix propagation.
+
+**More features** --> [User Guide](docs/user-guide.md)
+ 
+## Showcase
+
+| Feature | Preview |
+|---|---|
+| Showcase | ![](docs/images/ABeautifulGame.jpg) ![](docs/images/ToyCar.jpg) ![](docs/images/DamagedHelmet.jpg) ![](docs/images/Sponza.jpg) |
+| Material features | ![](docs/images/SunglassesKhronos.jpg) ![](docs/images/SheenCloth.jpg) ![](docs/images/TransmissionTest.jpg) ![](docs/images/volume.png) ![](docs/images/volume_scatter.png) ![](docs/images/IridescenceAbalone.jpg) |
+| Lighting and camera | ![](docs/images/sky_1.jpg) ![](docs/images/hdr_1.jpg) ![](docs/images/dof_1.jpg) ![](docs/images/light.jpg) |
+
+For a **full walkthrough** of rendering modes, editor workflows, and feature screenshots, see the [User Guide](docs/user-guide.md).
+
+For **headless timing** and optional scripted GPU benchmarks, see [Benchmarking](docs/benchmarking.md) (`utils/benchmark/`).
+
+## Agentic — AI-Assisted Generation
+
+Drive local generative AI from inside the renderer through an optional **[ComfyUI](https://www.comfy.org/)** bridge. Two tools are wired into the in-app **Agentic** window (press **F7**):
+
+- **Beautify Last Render** — send the current path-traced frame to a diffusion model and get it back photorealistic, or restyled by prompt (pencil, cartoon, watercolor, blueprint, and more).
+- **Generate HDRI From Prompt** — type a prompt and get a full 360° HDR environment, applied directly as the scene's lighting.
+
+Generation is entirely optional — the renderer runs without it.
+
+### Showcase
+
+Path-traced renders (left), beautified or restyled by prompt (right):
+
+| Original render | AI result |
+| ---- | ---- |
+| <img src="docs/images/agentic_i1.jpg" height="130"> | <img src="docs/images/agentic_i1_0.png" height="130"> |
+| <img src="docs/images/agentic_i2.jpg" height="130"> | <img src="docs/images/agentic_i2_0.png" height="130"> <img src="docs/images/agentic_i2_1.png" height="130"> <img src="docs/images/agentic_i2_2.png" height="130"> <img src="docs/images/agentic_i2_3.png" height="130"> |
+| <img src="docs/images/agentic_i3.jpg" height="130"> | <img src="docs/images/agentic_i3_0.png" height="130"> |
+
+### Setup
+
+Generation needs a local **ComfyUI** install, the diffusion models, and a small Python bridge that connects it to the renderer. The **[ComfyUI Agentic Setup](docs/comfyui-agentic-setup.md)** guide walks through it end to end:
+
+1. Install ComfyUI and download the models.
+2. Start ComfyUI.
+3. Open the **Agentic** window (**F7**) and use **Copy start command** to launch the bridge in a terminal; once the **Bridge** and **ComfyUI** status lights are green, generate.
+
+For the architecture, bridge directory layout, and request/response protocol behind it, see [Agentic Workflow](docs/agentic-workflow.md).
+
+## glTF Support
+
+**Reference scope:** The list below reflects what this renderer loads and displays. The **path tracer** is the authoritative PBR implementation — especially for ray-traced material evaluation, sampling, and new extensions (e.g. [KHR_materials_retroreflection](https://github.com/KhronosGroup/glTF/pull/2610)). The **rasterizer** is a preview path for interaction, not the primary material reference.
+
+### Core
+
+- ✅ glTF 2.0 (.gltf/.glb)
+- ✅ Images (HDR, PNG, JPEG, KTX, KTX2, DDS, WebP)
+- ✅ Buffers (geometry, animation, skinning)
+- ✅ Textures and samplers
+- ✅ Materials (PBR metallic-roughness and specular-glossiness)
+- ✅ Animations (keyframe, skeletal)
+- ✅ Skins
+- ✅ Morph targets
+- ✅ Cameras (perspective and orthographic)
+- ✅ Punctual lights (directional, point, spot)
+- ✅ Nodes and scene hierarchy
+- ✅ Multiple scenes
+
+### Extensions
+
+- ✅ [KHR_accessor_float64](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_accessor_float64)
+- ✅ [KHR_animation_pointer](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_animation_pointer)
+- ✅ [KHR_draco_mesh_compression](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_draco_mesh_compression)
+- ✅ [KHR_interactivity](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_interactivity) — executes behavior graphs: event/flow/math/type/variable operations, scene data binding via `pointer`/`variable` get/set/interpolate, animation clip playback, and hover/select event wiring, with a standalone Interactivity window for inspecting and controlling a running graph. See [docs/interactivity.md](docs/interactivity.md) for the current coverage table
+- ✅ [KHR_lights_punctual](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_lights_punctual)
+- ✅ [KHR_materials_anisotropy](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_anisotropy)
+- ✅ [KHR_materials_clearcoat](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_clearcoat)
+- ✅ [KHR_materials_diffuse_transmission](https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_materials_diffuse_transmission/README.md)
+- ✅ [KHR_materials_dispersion](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_dispersion)
+- ✅ [KHR_materials_emissive_strength](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_emissive_strength)
+- ✅ [KHR_materials_ior](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_ior)
+- ✅ [KHR_materials_iridescence](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_iridescence)
+- ✅ [KHR_materials_pbrSpecularGlossiness](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Archived/KHR_materials_pbrSpecularGlossiness)
+- ✅ [KHR_materials_retroreflection](https://github.com/KhronosGroup/glTF/pull/2610)
+- ✅ [KHR_materials_scatter](https://github.com/KhronosGroup/glTF/pull/2579)
+- ✅ [KHR_materials_sheen](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_sheen)
+- ✅ [KHR_materials_specular](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_specular)
+- ✅ [KHR_materials_transmission](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_transmission)
+- ✅ [KHR_materials_unlit](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_unlit)
+- ✅ [KHR_materials_variants](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_variants)
+- ✅ [KHR_materials_volume](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_volume)
+- ✅ [KHR_mesh_quantization](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_mesh_quantization)
+- ✅ [KHR_meshopt_compression](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_meshopt_compression)
+- ✅ [KHR_node_hoverability](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_node_hoverability)
+- ✅ [KHR_node_selectability](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_node_selectability)
+- ✅ [KHR_node_visibility](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_node_visibility)
+- ✅ [KHR_texture_basisu](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_texture_basisu)
+- ✅ [KHR_texture_transform](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_texture_transform)
+- ✅ [KHR_xmp_json_ld](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_xmp_json_ld)
+- ✅ [EXT_mesh_gpu_instancing](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Vendor/EXT_mesh_gpu_instancing)
+- ✅ [EXT_mesh_opacity_micromap](https://github.com/pixeljetstream/glTF/tree/EXT_mesh_opacity_micromap/extensions/2.0/Vendor/EXT_mesh_opacity_micromap)
+- ✅ [EXT_meshopt_compression](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Vendor/EXT_meshopt_compression)
+- ✅ [EXT_texture_webp](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Vendor/EXT_texture_webp)
+- ✅ [MSFT_texture_dds](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Vendor/MSFT_texture_dds)
 
+### glTF 2.1 (Complex Scenes — preview)
 
-## Debug
+Early support for the [glTF 2.1 complex-scene](https://www.khronos.org/blog/introducing-gltf-2.1-with-complex-scenes) composition features — the standardized successor to the earlier glTFX / External Reference proposals:
 
-There is also the ability to debug various out channels, such as:
+- ✅ External Assets — reference other glTF/GLB files from scene nodes (`node.externalAsset`) and instantiate them at load time
+- ✅ Multiple instances of the same asset share geometry (meshes / BLAS)
+- ✅ Nested external assets — recursive resolution with cycle detection
+- ✅ Unified file references — top-level `files` array (external `uri`)
+- ✅ File aliases — inner-URI redirection for shared or overridden resources
+- ✅ Re-externalized on save (references preserved); "Make Editable" embeds an asset inline
+- 🚧 Packaging — embedded external assets (`bufferView` / `data:` URI) not yet resolved
+- 🚧 Shapes and scene-level bounding volumes
 
-|metallic|roughness|normal|base|emissive|opacity|tangent|tex coord|
-|---|---|---|---|---|---|---|---|
-|![](doc/dbg_metallic.jpg)|![](doc/dbg_roughness.jpg)|![](doc/dbg_normal.jpg)|![](doc/dbg_base_color.jpg)|![](doc/dbg_emissive.jpg) |![](doc/dbg_opacity.jpg) |![](doc/dbg_tangent.jpg) | ![](doc/dbg_tex_coord.jpg) |
+See [External Assets](docs/external_assets.md) for design details.
 
+## Documentation
 
-## Environment
+**For users**
 
-### Sun & Sky
+- [User Guide](docs/user-guide.md) — renderer settings, PBR materials, scene editor, camera, environment, tone mapping, common CLI flags, and troubleshooting.
+- [ComfyUI Agentic Setup](docs/comfyui-agentic-setup.md) — set up the local ComfyUI install, models, and bridge to beautify renders and generate HDRIs from prompts.
+- [glTF Resources](docs/resources.md) — curated collection of glTF models, HDR environments, specifications, and tools.
 
-There is a built-in Sun & Sky physical shader module.
+**For contributors**
 
-![](doc/sky_1.jpg) ![](doc/sky_2.jpg) ![](doc/sky_3.jpg)
+- [Developer Guide](docs/developer.md) — architecture overview, source map, material system, and testing.
+- [Rendering Architecture](docs/RENDERING_ARCHITECTURE.md) — data flow from glTF model to GPU, BLAS/TLAS acceleration structures, and render nodes.
+- [External Assets](docs/external_assets.md) — glTF 2.1 complex scenes: reference / merge / edit / save mechanics.
+- [Agentic Workflow](docs/agentic-workflow.md) — architecture, filesystem bridge protocol, and roadmap behind the optional AI generation feature.
+- [Benchmarking](docs/benchmarking.md) — headless timing and scripted GPU benchmarks.
 
-### HDR 
+These docs explain concepts and workflows and point at *where* things live; enumerated facts (extension lists, CLI flags, enum values) are owned by the code.
 
-Lighting of the scene can come from HDRi.
+## License
 
-![](doc/hdr_1.jpg) ![](doc/hdr_2.jpg) ![](doc/hdr_3.jpg) ![](doc/hdr_4.jpg) <br> ![](doc/hdr_5.jpg) ![](doc/hdr_6.jpg) ![](doc/hdr_7.jpg) ![](doc/hdr_8.jpg)
-
-It is possible to blur HDR to various level.
-
-![](doc/hdr_1.jpg) ![](doc/hdr_blur_1.jpg) ![](doc/hdr_blur_2.jpg) ![](doc/hdr_blur_3.jpg)
-
-The HDR can also be rotated to get the right illumination.
-
-![](doc/hdr_1.jpg) ![](doc/hdr_rot_1.jpg)
-
-### Background
-
-Background can be also solid color and if saved as PNG, the alpha channel is taking into account. 
-
-![](doc/background_1.jpg) ![](doc/background_2.jpg) ![](doc/background_3.png)
-
-
-
-## Tonemapper
-
-We could not get good results without a tone mapper. This is done with a compute shader and different settings can be made.
-
-![](doc/tonemapper.png)
-
-Multiple tonemapper are supported:
-* [Filmic](http://filmicworlds.com/blog/filmic-tonemapping-operators/)
-* Uncharted 2
-* Clip : Simple Gamma correction (linear to sRGB)
-* [ACES](https://www.oscars.org/science-technology/sci-tech-projects/aces): Academy Color Encoding System
-* [AgX](https://github.com/EaryChow/AgX)
-* [Khronos PBR](https://github.com/KhronosGroup/ToneMapping/blob/main/PBR_Neutral/README.md#pbr-neutral-specification) : PBR Neutral Specification
-
-
-## Camera
-
-The camera navigation follows the [Softimage](https://en.wikipedia.org/wiki/Softimage_(company)) default behavior. This means, the camera is always looking at a point of interest and orbit around it.
-
-Here are the default navigations:
-
-![](doc/cam_info.png)
-
-The camera information can be fine tune by editing its values.
-
-![](doc/cam_1.png)
-
-Note: **copy** will copy in text the camera in the clipboard, and pressing the **paste** button will parse the clipboard to set the camera. 
-
-Ex: `{0.47115, 0.32620, 0.52345}, {-0.02504, -0.12452, 0.03690}, {0.00000, 1.00000, 0.00000}`
-
-### Save and Restore Cameras
-
-It is also possible to save and restore multiple cameras in the second tab. Press the `+` button to save a camera, the middle button to delete it. By pressing one of the saved cameras, its position, interests, orientation and FOV will be changed smoothly. 
-
-**Note**: If the glTF scene contains multiple cameras, they will be showing here. 
-
-![](doc/cam_2.png)
-
-### Other modes 
-
-Other navigation modes also exist, like fly, where the `w`, `a`, `s`, `d` keys also moves the camera. 
-
-![](doc/cam_3.png)
-
-## Depth-of-Field
-
-Depth of field works only for ray tracing and settings can be found under the `RendererPathtracer>Depth-of-Field`
-
-![](doc/dof_1.jpg) ![](doc/dof_2.jpg)
-
-
-----
-## Schema of the Program
-
-The nvvk::Application is a class that provides a framework for creating Vulkan applications. It encapsulates the Vulkan instance, device, and surface creation, as well as window management and event handling.
-
-When using `nvvk::Application`, you can attach `nvvkhl::IAppElement` to it and each element will be called for the different state, allowing to customize the behavior of your application. The `nvvkhl::IAppElement` class provides default implementations for these functions, so you only need to override the ones you need.
-
-Here is a brief overview of how `nvvk::Application` works:
-
-### Initialization:
-When you create an instance of `nvvk::Application`, it sets up the Vulkan instance, device, and surface. It also creates a window and sets up event handling.
-
-### Attaching Elements
-In `main()` we are attaching many elements, like:
-* `ElementCamera` : this allow to control a singleton camera
-* `ElementProfiler` : allow to time the execution on the GPU
-* `ElementBenchmarkParameters` : command line arguments and test purpose
-* `ElementLogger` : redirect log information in a window
-* `ElementNvml` : shows the status of the GPU
-
-But the main one that interest us, and which is the main of this application is `GltfRendererElement`. This is the one that will be controlling the scene and rendering.
-
-
-### Main Loop: 
-The `nvvk::Application` class provides a main loop that continuously processes events and updates the application state. Inside the main loop, it calls the following functions:
-
-* **onAttach()**:<br> 
-This function is called whenever the element is attached to the application. In `GltfRendererElement`, we are creating the resource needed internally. 
-
-* **onDetach()**: <br>
-This function is called when the user tries to close the window. You can override this function to handle window close events.
-
-* **onRender(VkCommandBuffer)**: <br>
-This function is called to render the frame using the current command buffer of the frame. You can override this function to perform rendering operations using Vulkan. In `GltfRendererElement` this is where the active renderer is called.
-
-* **onResize()**: <br>
-This function is called when the `viewport` is resized. You can override this function to handle window resize events. In `GltfRendererElement` the G-Buffer will be re-created
-
-* **onUIRender()**: <br>
-This function is called to allow the `IAppElement` to render the UI and to query any mouse or keyboard event. In `GltfRendererElement`, we render the UI, but also the final image. The rendered image is consider a UI element, and that image covers the entire `viewport` ImGui window. 
-
-* **onUIMenu()** <br>
-Will be modifying what we see in the the window title. It will also create the menu, like `File`, `Help` and deal with some key combinations.
-
-* **onFileDrop()** <br>
-Will receive the path of the file been dropped on. If it is a .gltf, .glb or .hdr, it will load that file. 
-
-
-
-----
-
-## Scene Graph
-
-The GLTF scene is loaded using tinygltf and then converted to a Vulkan version. The Vulkan version is a simplified version of the scene, where the geometry is stored in buffers, and the textures are uploaded to the GPU. The Vulkan version is used for both raster and ray tracing.
-
-The scene is composed of nodes, where each node can have children and each node can have a mesh. The mesh is composed of primitives, where each primitive has a material. The material is composed of textures and parameters. However, none of this is directly used in the rendering, as we are using a simplified version of the scene.
-
-![](doc/scene_graph.png)
-
-Once the scene has been loaded, we proceed to parse it in order to collect the RenderNodes and RenderPrimitives. The RenderNode represents the flattened version of the tree of nodes, where the world transformation matrix and the material are stored. The RenderPrimitive, in contrast, represents the unique version of the primitive, where the index and vertex buffers are stored.
-
-RenderNodes represent the elements to be rendered, while RenderPrimitives serve as references to the data utilized for rendering.
-
-### Animation
-
-If there is animation in the scene, a new section will appear under the Scene section.
-It allows to play/pause, step and reset the animation, as well as changing its speed.
-
-![](doc/animation_controls.png)
-
-
-### Multiple Scene 
-
-If there are multiple scenes,  a new section will appear under the Scene section.
-It will show all the scenes and their name. Clicking on a scene name will switch to the scene.
-
-![](doc/multiple_scenes.png)
-
-
-### Material Variant
-
-If there are multiple material variant, a new section will appear under the Scene section.
-It will show all the material variant and their name. Clicking on a variant name will apply it on the models.
-
-![](doc/material_variant.png)
-
-
-### Scene Graph UI
-
-![](doc/scene_graph_ui.png)
-
-It is possible to visualize the scene hierarchy, to select node, to modify their transformation and their material, to some level.
-
-Here's a shorter version of the text, tailored for developers on GitHub:
-
-### Recompiling Shaders
-For quick shader testing, use the `Recompile Shaders` button to hot-reload Slang shaders (F5). The shaders are located in the `shaders` folder and are automatically compiled during the build process.
-
-Note: Hot-reloading won't work without the shared libraries and shaders, but the app will still run.
-
-## Tools
-
-The application comes with a few tools to help debug and visualize the scene.
-
-### Profiler
-
-The profiler is a tool that allows to measure the time spent on the GPU. It is possible to measure the time spent on the different stages of the rendering, like the path tracing, the rasterization, the tonemapping, etc.
-
-![](doc/profiler.png)
-
-### Logger
-
-The logger is a tool that allows to see the log information. It is possible to filter the log information by selecting the level of the log.
-
-![](doc/logger.png)
-
-### Nvml
-
-The Nvml is a tool that allows to see the status of the GPU. It is possible to see the temperature, the power, the memory usage, etc.
-
-![](doc/nvml.png)
-
-### Tangent Space
-
-There is a tangent space tool that allows to fix or to recreate the tangent space of the model. This is useful when the normal map is not looking right or there are errors with the tangents in the scene.
-
-## Utilities
-
-### gltf-material-modifier.py
-
-Modify materials in a GLTF file and optionally reorient the scene from Z-up to Y-up.
-
-```
-usage: gltf-material-modifier.py [-h] [--metallic METALLIC] [--roughness ROUGHNESS] [--override] [--reorient]
-                                 input_file output_file
-```                                 
-
-positional arguments:
-```
-   input_file            Path to the input GLTF file.
-   output_file           Path to save the modified GLTF file.
-```
-
-options:
-```
-  -h, --help             show this help message and exit
-  --metallic METALLIC    Set the metallic factor (default: 0.1).
-  --roughness ROUGHNESS  Set the roughness factor (default: 0.1).
-  --override             Override existing material values if set.
-  --reorient             Reorient the scene from Z-up to Y-up.
-```
+[Apache License 2.0](LICENSE) - Copyright (c) 2023-2026, NVIDIA CORPORATION.

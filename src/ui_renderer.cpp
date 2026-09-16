@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,331 +13,624 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
+//
+// Main renderer UI and application loop. Orchestrates scene loading,
+// environment map setup, camera control, renderer switching (path tracer /
+// rasterizer), picking, gizmo interaction, animation playback, and
+// the top-level ImGui layout with viewport, menus, and side panels.
+//
+
+#include <algorithm>
+#include <cfloat>
 #include <filesystem>
+#include <limits>
 #include <fmt/format.h>
 #include <GLFW/glfw3.h>
 #include <glm/gtc/type_ptr.hpp>
 #include <imgui.h>
 
-#include "create_tangent.hpp"
-#include "nvgui/axis.hpp"
-#include "nvgui/file_dialog.hpp"
-#include "nvgui/tonemapper.hpp"
-#include "nvutils/bounding_box.hpp"
-#include "renderer.hpp"
-#include "ui_collapsing_header_manager.h"
-#include "ui_mouse_state.hpp"
-#include "ui_renderer.hpp"
+#include <nvgui/axis.hpp>
+#include <nvgui/file_dialog.hpp>
+#include <nvgui/fonts.hpp>
+#include <nvgui/hover_scrolling.hpp>
+#include <nvgui/tonemapper.hpp>
+#include <nvgui/tooltip.hpp>
+#include <nvutils/bounding_box.hpp>
+#include <nvutils/file_operations.hpp>
+#include <nvvk/check_error.hpp>
 
-void GltfRendererUI::mouseClickedInViewport(GltfRenderer& renderer)
+#include <nvapp/elem_camera.hpp>
+
+#include "renderer.hpp"
+#include "gltf_create_tangent.hpp"
+#include "gltf_scene_editor.hpp"
+#include "scoped_banner.hpp"
+#include "tinygltf_utils.hpp"
+#include "ui_animation.hpp"
+#include "ui_interactivity.hpp"
+#include "ui_linear_color.hpp"
+#include "ui_mouse_state.hpp"
+#include "version.hpp"
+
+// The Agentic window toggle (menu / toolbar / F7) is only wired when USE_AGENTIC
+// is built; this keeps it out of the window-toggle tables in a non-Agentic build
+// so there is no dead control.
+#ifdef USE_AGENTIC
+static constexpr size_t kAgenticToggleCount = 1;
+#else
+static constexpr size_t kAgenticToggleCount = 0;
+#endif
+
+void GltfRenderer::mouseClickedInViewport()
 {
   static UiMouseState s_mouseClickState;  // Mouse click state
 
-  s_mouseClickState.update();
+  // Allow input when hovered, or when the gizmo is mid-drag (mouse may have left the viewport).
+  if(!ImGui::IsWindowHovered(ImGuiFocusedFlags_RootWindow) && !m_visualHelpers.transform.isDragging())
+    return;
 
-  if(!renderer.m_resources.scene.valid())
+  // Do not pick if the scene is not valid or the renderer is busy
+  if(!m_resources.getScene() || !m_resources.getScene()->valid() || m_busy.isBusy())
   {
     return;
   }
 
+  s_mouseClickState.update();
+
+  // Process gizmo input before ray picking (gizmo gets priority)
+  if(m_resources.settings.showGizmo && m_visualHelpers.transform.isAttached())
+  {
+    ImVec2 mousePos  = ImGui::GetMousePos();
+    ImVec2 cursorPos = ImGui::GetCursorScreenPos();
+    ImVec2 avail     = ImGui::GetContentRegionAvail();
+
+    glm::vec2 localMouse(mousePos.x - cursorPos.x, mousePos.y - cursorPos.y);
+    glm::vec2 mouseDelta(ImGui::GetIO().MouseDelta.x, ImGui::GetIO().MouseDelta.y);
+    glm::vec2 viewportSize(avail.x, avail.y);
+
+    bool mouseDown     = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    bool mousePressed  = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    bool mouseReleased = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
+
+    bool gizmoActive = m_visualHelpers.transform.processInput(localMouse, mouseDelta, mouseDown, mousePressed,
+                                                              mouseReleased, m_cameraManip->getViewMatrix(),
+                                                              m_cameraManip->getPerspectiveMatrix(), viewportSize);
+
+    if(gizmoActive || m_visualHelpers.transform.isDragging())
+      return;
+  }
+
   // If double-clicking in the "Viewport", shoot a ray to the scene under the mouse.
   // If the ray hit something, set the camera center to the hit position.
-  if(ImGui::IsWindowHovered(ImGuiFocusedFlags_RootWindow) && (s_mouseClickState.isMouseClicked(ImGuiMouseButton_Left)))
+  //
+  // The actual ray-pick GPU work is deferred (see m_pendingClickPick's comment in renderer.hpp) -
+  // this just captures everything it needs at the moment of the click (camera state included, so
+  // a camera move between now and when onRender() records the pick doesn't skew the ray) and hands
+  // it off. No GPU work, no wait - this function is now as cheap as updateHoverCursorPosition().
+  //
+  // Two ways a click can be recognized:
+  //  - Normal editing: s_mouseClickState's single/double-click debounce (waits io.MouseDoubleClickTime,
+  //    ImGui's default 0.3s, to see if a second click follows) so a double-click can mean "recenter
+  //    camera" instead of "select".
+  //  - While a KHR_interactivity graph is playing: double-click-to-recenter isn't something a
+  //    click-driven graph needs, and that debounce is exactly the "still feels laggy" delay users
+  //    notice even after the GPU wait was removed - so skip it entirely and react on the release
+  //    itself (isMouseReleasedNoDrag still correctly excludes camera-orbit drags).
+  const bool interactivityPlaying = isInteractivityPlaying();
+  const bool clicked = interactivityPlaying ? s_mouseClickState.isMouseReleasedNoDrag(ImGuiMouseButton_Left) :
+                                              s_mouseClickState.isMouseClicked(ImGuiMouseButton_Left);
+  if(clicked)
   {
-    nvutils::ScopedTimer st("RayPicker");
-    VkCommandBuffer      cmd = renderer.m_app->createTempCmdBuffer();
     // Convert screen coordinates to normalized viewport coordinates [0,1]
     ImVec2 mousePos      = ImGui::GetMousePos();
     ImVec2 cursorPos     = ImGui::GetCursorScreenPos();
     ImVec2 avail         = ImGui::GetContentRegionAvail();
     ImVec2 localMousePos = ImVec2((mousePos.x - cursorPos.x) / avail.x, (mousePos.y - cursorPos.y) / avail.y);
 
-    renderer.m_rayPicker.run(cmd, {.modelViewInv = glm::inverse(renderer.m_resources.cameraManip->getViewMatrix()),
-                                   .perspectiveInv = glm::inverse(renderer.m_resources.cameraManip->getPerspectiveMatrix()),
-                                   .pickPos = {localMousePos.x, localMousePos.y},
-                                   .tlas    = renderer.m_resources.sceneRtx.tlas()});
-    renderer.m_app->submitAndWaitTempCmdBuffer(cmd);
-    nvvk::RayPicker::PickResult pickResult = renderer.m_rayPicker.getResult();
+    m_pendingClickPick = PendingClickPick{
+        .modelViewInv   = glm::inverse(m_cameraManip->getViewMatrix()),
+        .perspectiveInv = glm::inverse(m_cameraManip->getPerspectiveMatrix()),
+        .isOrthographic = (m_cameraManip->getProjectionType() == nvutils::CameraManipulator::Orthographic) ? 1 : 0,
+        .pickPos        = {localMousePos.x, localMousePos.y},
+        .isDoubleClick  = !interactivityPlaying && s_mouseClickState.isMouseDoubleClicked(ImGuiMouseButton_Left),
+    };
+  }
+}
 
-    // Set or de-select the selected object
-    if(s_mouseClickState.isMouseSingleClicked(ImGuiMouseButton_Left))
+// Applies a completed async ray-pick result (see m_pendingClickPick's comment in renderer.hpp for
+// the full pipeline) - selection, and on a double click, camera recenter. Exactly the logic that
+// used to run inline in mouseClickedInViewport() right after its now-removed blocking GPU wait.
+void GltfRenderer::applyClickPickResult(const nvvk::RayPicker::PickResult& pickResult, bool isDoubleClick)
+{
+  // Environment was picked (no hit)
+  const bool hasHit = pickResult.instanceID >= 0;
+  // KHR_interactivity event/onSelect's selectionPoint/selectionRayOrigin - real ray-pick hit
+  // point/origin (global space) when this click actually hit something, so a bound onSelect
+  // handler sees finite values instead of the "no ray info" NaN fallback (KHR_node_selectability
+  // README ~110 spec-sanctions NaN when there's no ray, but this IS a ray, so it must be used).
+  glm::vec3 worldPos = hasHit ? pickResult.worldRayOrigin + pickResult.worldRayDirection * pickResult.hitT : glm::vec3(0);
+
+  // Set or de-select the selected object (primitive-level selection)
+  // pickResult.instanceID is the TLAS instance index = render node index
+  if(!isDoubleClick)
+  {
+    updateSelectionFromPick(pickResult.instanceID, worldPos, pickResult.worldRayOrigin);
+  }
+
+  if(!hasHit)
+    return;
+  if(isDoubleClick)
+  {
+    // Set the camera CENTER to the hit position
+    glm::dvec3 eye, center, up;
+    m_cameraManip->getLookat(eye, center, up);
+    m_cameraManip->setLookat(eye, worldPos, up, false);  // Nice with CameraManip.updateAnim();
+    m_cameraManip->setSpeed(pickResult.hitT);            // Re-adjust speed based on the new distance
+  }
+
+  {
+    const int        renderNodeIdx = pickResult.instanceID;
+    nvvkgltf::Scene* scene         = m_resources.getScene();
+    const auto&      renderNodes   = scene->getRenderNodes();
+    if(renderNodeIdx >= 0 && renderNodeIdx < static_cast<int>(renderNodes.size()))
     {
-      renderer.m_resources.selectedObject = pickResult.instanceID;
-      int nodeID                          = -1;
-      if(pickResult.instanceID > -1)
-      {
-        const nvvkgltf::RenderNode& renderNode = renderer.m_resources.scene.getRenderNodes()[pickResult.instanceID];
-        nodeID                                 = renderNode.refNodeID;
-      }
-      renderer.m_uiSceneGraph.selectNode(nodeID);
-    }
-
-    // Environment was picked (no hit)
-    if(pickResult.instanceID < 0)
-      return;
-
-    glm::vec3 worldPos = pickResult.worldRayOrigin + pickResult.worldRayDirection * pickResult.hitT;
-    if(s_mouseClickState.isMouseDoubleClicked(ImGuiMouseButton_Left))
-    {
-      // Set the camera CENTER to the hit position
-      glm::vec3 eye, center, up;
-      renderer.m_resources.cameraManip->getLookat(eye, center, up);
-      renderer.m_resources.cameraManip->setLookat(eye, worldPos, up, false);  // Nice with CameraManip.updateAnim();
-    }
-
-    {
-      // Logging picking info.
-      const nvvkgltf::RenderNode& renderNode = renderer.m_resources.scene.getRenderNodes()[pickResult.instanceID];
-      const tinygltf::Node&       node       = renderer.m_resources.scene.getModel().nodes[renderNode.refNodeID];
+      const nvvkgltf::RenderNode& renderNode = renderNodes[renderNodeIdx];
+      const tinygltf::Node&       node       = scene->getModel().nodes[renderNode.refNodeID];
       LOGI("Node Name: %s\n", node.name.c_str());
       LOGI(" - GLTF: NodeID: %d, MeshID: %d, TriangleId: %d\n", renderNode.refNodeID, node.mesh, pickResult.primitiveID);
-      LOGI(" - Render: RenderNode: %d, RenderPrim: %d\n", pickResult.instanceID, pickResult.instanceCustomIndex);
+      LOGI(" - Render: renderNode: %d, RenderPrim: %d\n", renderNodeIdx, pickResult.instanceCustomIndex);
       LOGI("{%3.2f, %3.2f, %3.2f}, Dist: %3.2f\n", worldPos.x, worldPos.y, worldPos.z, pickResult.hitT);
-
-      renderer.m_uiSceneGraph.selectNode(renderNode.refNodeID);
     }
   }
 }
 
-nvutils::Bbox GltfRendererUI::getRenderNodeBbox(GltfRenderer& renderer, int nodeID)
+// Captures whether the cursor is currently over the 3D viewport and, if so, its pixel position in
+// render-target space - consumed by onRender()'s updateHoverState()/HoverPicker later this same
+// frame (docs/interactivity.md Phase E). Must be called from the viewport window's ImGui code,
+// right where mouseClickedInViewport() computes the equivalent position for click-picking.
+void GltfRenderer::updateHoverCursorPosition()
 {
-  nvutils::Bbox worldBbox({-1, -1, -1}, {1, 1, 1});
-  if(nodeID < 0 || !renderer.m_resources.scene.valid())
+  m_hoverCursorInViewport = ImGui::IsWindowHovered(ImGuiFocusedFlags_RootWindow) && m_resources.getScene()
+                            && m_resources.getScene()->valid() && !m_busy.isBusy();
+  if(!m_hoverCursorInViewport)
+    return;
+
+  const ImVec2     mousePos  = ImGui::GetMousePos();
+  const ImVec2     cursorPos = ImGui::GetCursorScreenPos();
+  const ImVec2     avail     = ImGui::GetContentRegionAvail();
+  const VkExtent2D imgSize   = m_resources.gBuffers.getSize();
+  m_hoverCursorPixel = {static_cast<int>((mousePos.x - cursorPos.x) / avail.x * static_cast<float>(imgSize.width)),
+                        static_cast<int>((mousePos.y - cursorPos.y) / avail.y * static_cast<float>(imgSize.height))};
+}
+
+bool GltfRenderer::isInteractivityPlaying() const
+{
+  const nvvkgltf::Scene* scene = m_resources.getScene();
+  return scene && !scene->getInteractivityGraphs().empty() && m_resources.interactivityControl.play;
+}
+
+// Update the current selection from a ray-pick result. `renderNodeIdx` is the TLAS instance index
+// (== render node index), or < 0 when the environment/nothing was hit. `selectionPoint`/
+// `selectionRayOrigin` (global space) are threaded through to SceneSelection::selectPrimitive() for
+// KHR_interactivity event/onSelect; default NaN for callers with no real ray (e.g. script-driven tests).
+void GltfRenderer::updateSelectionFromPick(int renderNodeIdx, const glm::vec3& selectionPoint, const glm::vec3& selectionRayOrigin)
+{
+  const auto clearSelection = [&]() {
+    m_resources.selectedRenderNodes.clear();
+    m_sceneSelection.clearSelection();
+  };
+
+  nvvkgltf::Scene* scene       = m_resources.getScene();
+  const auto&      renderNodes = scene->getRenderNodes();
+
+  // Nothing hit, or invalid instance: clear the selection.
+  if(renderNodeIdx < 0 || renderNodeIdx >= static_cast<int>(renderNodes.size()))
+  {
+    clearSelection();
+    return;
+  }
+
+  // Clicking the currently selected primitive again de-selects it - standard editor behavior, but
+  // actively harmful while a KHR_interactivity graph is playing: every other click on the same node
+  // (e.g. re-clicking a lever/button several times in a row) would silently eat the click as a
+  // deselect instead of re-firing event/onSelect, making the graph feel like it needs "two clicks"
+  // to react. Skip the toggle while a graph is actually running, so every click re-selects and
+  // re-fires the event; click-to-deselect still works normally once the graph is paused/absent.
+  if(!isInteractivityPlaying() && m_resources.selectedRenderNodes.size() == 1 && m_resources.selectedRenderNodes.count(renderNodeIdx))
+  {
+    clearSelection();
+    return;
+  }
+
+  // KHR_node_selectability: honor author intent. If the picked node opts out of selection (itself or
+  // via an ancestor with `selectable:false`), redirect to the nearest selectable ancestor, or clear.
+  if(!scene->isNodeSelectable(renderNodes[renderNodeIdx].refNodeID))
+  {
+    int selectableNodeID = scene->nearestSelectableAncestor(renderNodes[renderNodeIdx].refNodeID);
+    if(selectableNodeID >= 0)
+    {
+      m_sceneSelection.selectNode(selectableNodeID, selectionPoint, selectionRayOrigin);
+      m_sceneBrowser.focusOnSelection();
+    }
+    else
+    {
+      clearSelection();
+    }
+    return;
+  }
+
+  // The picked node is read-only (e.g. part of a referenced external asset). Select the first
+  // editable ancestor instead, so the user can still change its transformation.
+  if(scene->isNodeReadOnly(renderNodes[renderNodeIdx].refNodeID))
+  {
+    int editableNodeID = renderNodes[renderNodeIdx].refNodeID;
+    while(editableNodeID >= 0 && scene->isNodeReadOnly(editableNodeID))
+      editableNodeID = scene->editor().getNodeParent(editableNodeID);
+
+    if(editableNodeID >= 0)
+    {
+      m_sceneSelection.selectNode(editableNodeID, selectionPoint, selectionRayOrigin);
+      m_sceneBrowser.focusOnSelection();
+    }
+    else
+    {
+      clearSelection();
+    }
+    return;
+  }
+
+  // Regular case: select the picked primitive.
+  const auto& renderNode = renderNodes[renderNodeIdx];
+  int         nodeID     = renderNode.refNodeID;
+  int         primIndex  = scene->getPrimitiveIndexForRenderNode(renderNodeIdx);
+  int         meshID     = scene->getModel().nodes[nodeID].mesh;
+
+  m_resources.selectedRenderNodes = {renderNodeIdx};
+  m_sceneSelection.selectPrimitive(renderNodeIdx, nodeID, primIndex, meshID, selectionPoint, selectionRayOrigin);
+  m_sceneBrowser.focusOnSelection();
+}
+
+nvutils::Bbox GltfRenderer::getRenderNodeBbox(int renderNodeIndex)
+{
+  nvutils::Bbox    worldBbox({-1, -1, -1}, {1, 1, 1});
+  nvvkgltf::Scene* scene = m_resources.getScene();
+  if(renderNodeIndex < 0 || !scene || !scene->valid())
     return worldBbox;
 
-  const nvvkgltf::RenderNode& renderNode = renderer.m_resources.scene.getRenderNodes()[nodeID];
-  const nvvkgltf::RenderPrimitive& renderPrimitive = renderer.m_resources.scene.getRenderPrimitive(renderNode.renderPrimID);
-  const tinygltf::Model&    model    = renderer.m_resources.scene.getModel();
-  const tinygltf::Accessor& accessor = model.accessors[renderPrimitive.pPrimitive->attributes.at("POSITION")];
+  const auto& renderNodes = scene->getRenderNodes();
+  if(renderNodeIndex >= static_cast<int>(renderNodes.size()))
+    return worldBbox;
+
+  const nvvkgltf::RenderNode&      renderNode      = renderNodes[renderNodeIndex];
+  const nvvkgltf::RenderPrimitive& renderPrimitive = scene->getRenderPrimitive(renderNode.renderPrimID);
+  const tinygltf::Model&           model           = scene->getModel();
+  const tinygltf::Accessor&        accessor = model.accessors[renderPrimitive.pPrimitive->attributes.at("POSITION")];
 
   glm::vec3 minValues = {-1.f, -1.f, -1.f};
   glm::vec3 maxValues = {1.f, 1.f, 1.f};
   if(!accessor.minValues.empty())
-    minValues = glm::vec3(accessor.minValues[0], accessor.minValues[1], accessor.minValues[2]);
+    minValues = {tinygltf::utils::getAccessorNormalizedValue(accessor, accessor.minValues[0]),
+                 tinygltf::utils::getAccessorNormalizedValue(accessor, accessor.minValues[1]),
+                 tinygltf::utils::getAccessorNormalizedValue(accessor, accessor.minValues[2])};
   if(!accessor.maxValues.empty())
-    maxValues = glm::vec3(accessor.maxValues[0], accessor.maxValues[1], accessor.maxValues[2]);
+    maxValues = {tinygltf::utils::getAccessorNormalizedValue(accessor, accessor.maxValues[0]),
+                 tinygltf::utils::getAccessorNormalizedValue(accessor, accessor.maxValues[1]),
+                 tinygltf::utils::getAccessorNormalizedValue(accessor, accessor.maxValues[2])};
   nvutils::Bbox objBbox(minValues, maxValues);
-  worldBbox = objBbox.transform(renderNode.worldMatrix);
+
+  glm::mat4 nodeWorld = scene->computeNodeWorldMatrix(renderNode.refNodeID);
+
+  // Extension: Instance local matrices for KHR_mesh_gpu_instancing
+  const auto& gpuInstMap = scene->getGpuInstanceLocalMatrices();
+  auto        instIt     = gpuInstMap.find(renderNode.refNodeID);
+  if(instIt != gpuInstMap.end() && !instIt->second.empty())
+  {
+    const auto& rnList = scene->getRenderNodeRegistry().getRenderNodesForNode(renderNode.refNodeID);
+    for(size_t k = 0; k < rnList.size(); ++k)
+    {
+      if(rnList[k] == renderNodeIndex)
+      {
+        nodeWorld = nodeWorld * instIt->second[k % instIt->second.size()];
+        break;
+      }
+    }
+  }
+  worldBbox = objBbox.transform(nodeWorld);
 
   return worldBbox;
 }
 
-void GltfRendererUI::windowTitle(GltfRenderer& renderer)
+nvutils::Bbox GltfRenderer::getRenderNodesBbox(const std::unordered_set<int>& renderNodeIndices)
+{
+  nvutils::Bbox unionBbox;
+  for(int idx : renderNodeIndices)
+    unionBbox.insert(getRenderNodeBbox(idx));
+  if(unionBbox.isEmpty())
+    return {};
+  return unionBbox;
+}
+
+// Centered warning banner drawn over the viewport image when Environment Type = None leaves the
+// scene with no light source (no punctual lights, no emissive materials), so the frame is fully
+// black. Anchored to the top-center of the passed image rectangle.
+static void drawNoLightOverlay(const ImVec2& imageTopLeft, const ImVec2& imageSize)
+{
+  const char* line1 = ICON_MS_WARNING " Environment Type is \"None\" and the scene has no lights";
+  const char* line2 = "Add a light or an emissive material, or set Environment to Sky / HDR";
+
+  ImDrawList*  dl = ImGui::GetWindowDrawList();
+  const ImVec2 pad(14.f, 10.f);
+  const ImVec2 sz1     = ImGui::CalcTextSize(line1);
+  const ImVec2 sz2     = ImGui::CalcTextSize(line2);
+  const float  spacing = ImGui::GetStyle().ItemSpacing.y;
+  const float  boxW    = std::max(sz1.x, sz2.x) + pad.x * 2.f;
+  const float  boxH    = sz1.y + sz2.y + spacing + pad.y * 2.f;
+
+  const float  cx  = imageTopLeft.x + imageSize.x * 0.5f;
+  const float  top = imageTopLeft.y + imageSize.y * 0.12f;  // upper area, not flush against the edge
+  const ImVec2 boxMin(cx - boxW * 0.5f, top);
+  const ImVec2 boxMax(boxMin.x + boxW, boxMin.y + boxH);
+
+  dl->AddRectFilled(boxMin, boxMax, IM_COL32(30, 25, 0, 210), 6.f);
+  dl->AddRect(boxMin, boxMax, IM_COL32(230, 190, 40, 230), 6.f, 0, 1.5f);
+
+  dl->AddText(ImVec2(cx - sz1.x * 0.5f, boxMin.y + pad.y), IM_COL32(255, 210, 70, 255), line1);
+  dl->AddText(ImVec2(cx - sz2.x * 0.5f, boxMin.y + pad.y + sz1.y + spacing), IM_COL32(220, 220, 220, 235), line2);
+}
+
+void GltfRenderer::windowTitle()
 {
   static float dirty_timer = 0.0F;
   dirty_timer += ImGui::GetIO().DeltaTime;
   if(dirty_timer > 1.0F)  // Refresh every seconds
   {
-    const VkExtent2D&     size     = renderer.m_app->getViewportSize();
-    std::filesystem::path filename = renderer.m_resources.scene.getFilename().filename();
+    const VkExtent2D&     size = m_app->getViewportSize();
+    std::filesystem::path filename;
+    if(m_resources.getScene())
+      filename = m_resources.getScene()->getFilename().filename();
     if(filename.empty())
     {
       filename = "No Scene";
     }
-    std::string text = fmt::format("{} - {}x{} | {:.0f} FPS / {:.3f}ms | Frame {}", nvutils::utf8FromPath(filename),
-                                   size.width, size.height, ImGui::GetIO().Framerate, 1000.F / ImGui::GetIO().Framerate,
-                                   renderer.m_resources.frameCount);
+    std::string text = fmt::format("{} {} - {}x{} | {:.0f} FPS / {:.3f}ms | Frame {}", nvutils::utf8FromPath(filename),
+                                   APP_VERSION_STRING, size.width, size.height, ImGui::GetIO().Framerate,
+                                   1000.F / ImGui::GetIO().Framerate, m_resources.frameCount);
 
-    glfwSetWindowTitle(renderer.m_app->getWindowHandle(), text.c_str());
+    glfwSetWindowTitle(m_app->getWindowHandle(), text.c_str());
     dirty_timer = 0;
   }
 }
 
-void GltfRendererUI::renderUI(GltfRenderer& renderer)
+// Helper function to load HDR files
+void GltfRenderer::loadHdrFileDialog()
 {
-  static int frameCount    = 0;
-  auto&      headerManager = CollapsingHeaderManager::getInstance();
+  std::filesystem::path filename =
+      nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Load HDR Environment", "HDR Image|*.hdr", m_lastHdrDirectory);
+  if(!filename.empty())
+  {
+    onFileDrop(filename.c_str());
+  }
+}
+
+// Image picker for the inspector's "Load from file" texture action (see UiInspector import hooks).
+std::filesystem::path GltfRenderer::pickImageFile()
+{
+  const std::filesystem::path filename =
+      nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Load Texture Image",
+                                  "Images|*.png;*.jpg;*.jpeg;*.ktx;*.ktx2;*.dds;*.webp;*.tga;*.bmp;*.hdr;*.exr",
+                                  m_lastImageDirectory);
+  if(!filename.empty())
+    m_lastImageDirectory = filename.parent_path();
+  return filename;
+}
+
+void GltfRenderer::renderBenchmarkViewport()
+{
+  // GPU rendering runs in onRender(); the swapchain only shows content when ImGui draws
+  // the tonemapped G-buffer (see Application::renderToSwapchain).
+  m_cameraManip->updateAnim();
+
+  const ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(vp->WorkPos);
+  ImGui::SetNextWindowSize(vp->WorkSize);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0F, 0.0F));
+  ImGui::Begin("Viewport", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize
+                   | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+  if(m_resources.getScene() && m_resources.getScene()->valid())
+  {
+    const ImVec2 imageSize = ImGui::GetContentRegionAvail();
+    ImGui::Image(m_resources.tonemappedUi, imageSize);
+  }
+
+  ImGui::End();
+  ImGui::PopStyleVar();
+}
+
+void GltfRenderer::renderUI()
+{
+  static int frameCount = 0;
 
   namespace PE = nvgui::PropertyEditor;
   {  // Setting menu
     bool changed{false};
 
-    if(ImGui::Begin("Camera"))
-    {
-      nvgui::CameraWidget(renderer.m_resources.cameraManip);
-    }
-    ImGui::End();  // End Camera
+    // Auto-poll + heartbeat refresh in one call (throttled internally).
+#ifdef USE_AGENTIC
+    m_agentic.tick();
+#endif
 
-    // Scene Graph UI
+    if(m_resources.settings.showCameraWindow)
     {
-      int selectedNode = renderer.m_uiSceneGraph.selectedNode();
-      renderer.m_uiSceneGraph.render();
-      // If the selected node has changed, update the selected render node index
-      if(selectedNode != renderer.m_resources.selectedObject)
+      if(ImGui::Begin("Camera", &m_resources.settings.showCameraWindow))
       {
-        auto it = renderer.m_nodeToRenderNodeMap.find(selectedNode);
-        if(it != renderer.m_nodeToRenderNodeMap.end())
-        {
-          renderer.m_resources.selectedObject = it->second;
-        }
-        else
-        {
-          renderer.m_resources.selectedObject = -1;  // No matching render node
-        }
+        nvgui::tooltip("Press F1 to toggle this window");
+        nvgui::CameraWidget(m_cameraManip);
       }
+      ImGui::End();  // End Camera
     }
 
-    if(frameCount < 2)  // This is a hack to make the settings window focus on the first frame
-    {
-      ImGui::SetNextWindowFocus();
-      frameCount++;
-    }
+    // KHR_interactivity Graphs window: closed by default, opt-in via the View menu or toolbar
+    // indicator. renderWindow() itself handles the ImGui::Begin/End pair and every no-op case
+    // (no scene, no graph, window closed) - this is the whole call site.
+    ui::interactivity::renderWindow(m_resources.getScene(), m_resources.interactivityControl,
+                                    &m_resources.settings.showInteractivityWindow);
 
-    if(ImGui::Begin("Settings"))
+    // Scene Browser system: translate selection events into Resources for silhouette and fit-object
     {
-      // Add renderer selection at the top level of the Settings panel for better visibility
-      if(PE::begin())
-      {
-        static const char* rendererItems[] = {"Path Tracer", "Rasterizer"};
-        int                currentItem     = static_cast<int>(renderer.m_resources.settings.renderSystem);
-        if(PE::Combo("Active Renderer", &currentItem, rendererItems, IM_ARRAYSIZE(rendererItems)))
+      m_sceneSelection.setEventCallback([&](const SceneSelection::Event& event) {
+        switch(event.type)
         {
-          renderer.m_resources.settings.renderSystem = static_cast<RenderingMode>(currentItem);
-          changed                                    = true;  // Reset frame counter when switching renderers
-        }
-        changed |= PE::Combo("Debug Method", reinterpret_cast<int32_t*>(&renderer.m_resources.settings.debugMethod),
-                             "None\0BaseColor\0Metallic\0Roughness\0Normal\0Tangent\0Bitangent\0Emissive\0Opacity\0TexCoord0\0TexCoord1\0\0");
-        PE::end();
-        if(renderer.m_resources.settings.renderSystem == RenderingMode::ePathtracer)
-        {
-          if(headerManager.beginHeader("Path Tracer"))
-          {
-            changed |= renderer.m_pathTracer.onUIRender(renderer.m_resources);
-            PE::begin();
-            PE::Text("Current frame", std::to_string(renderer.m_resources.frameCount));
-            changed |= PE::SliderInt("Max Iterations", &renderer.m_resources.settings.maxFrames, 0, 10000, "%d", 0,
-                                     "Maximum number of iterations");
-            PE::end();
+          case SceneSelection::EventType::CameraApply:
+            applyGltfCamera(event.data);
+            break;
+          case SceneSelection::EventType::CameraSetFromView:
+            setGltfCameraFromView(event.data);
+            break;
+          case SceneSelection::EventType::NodeSelected: {
+            m_resources.selectedRenderNodes.clear();
+            nvvkgltf::Scene* scn = m_resources.getScene();
+            if(scn && scn->valid())
+            {
+              const int        nodeIdx = event.data;
+              std::vector<int> renderNodeIDs;
+              scn->getRenderNodeRegistry().getAllRenderNodesForNodeRecursive(
+                  nodeIdx,
+                  [scn](int nid) {
+                    const auto& node = scn->getModel().nodes[static_cast<size_t>(nid)];
+                    return node.children;
+                  },
+                  renderNodeIDs);
+              for(int id : renderNodeIDs)
+                m_resources.selectedRenderNodes.insert(id);
+              // KHR_interactivity event/onSelect: real ray-pick hit point/origin when this selection
+              // was redirected here from an actual 3D-viewport click (e.g. KHR_node_selectability's
+              // nearest-selectable-ancestor fallback in updateSelectionFromPick()) - NaN (the
+              // spec-sanctioned "no ray info" fallback) otherwise (Scene Browser click, script-driven
+              // `selectnode`, ...; SceneSelection::selectNode's default parameters already are NaN).
+              scn->notifyNodeSelected(nodeIdx, event.selectionPoint, event.selectionRayOrigin);
+            }
+            break;
           }
+          case SceneSelection::EventType::PrimitiveSelected: {
+            m_resources.selectedRenderNodes = {event.renderNodeIndex};
+            nvvkgltf::Scene* scn            = m_resources.getScene();
+            if(scn && scn->valid())
+            {
+              // KHR_interactivity event/onSelect: real ray-pick hit point/origin when this came from
+              // an actual 3D-viewport click (SceneSelection::selectPrimitive's default parameters
+              // are already the spec-sanctioned NaN fallback for callers with no ray - e.g. tests).
+              scn->notifyNodeSelected(event.data, event.selectionPoint, event.selectionRayOrigin);
+            }
+            break;
+          }
+          case SceneSelection::EventType::MaterialSelected:
+            // Material selection event
+            break;
         }
-        else
-        {
-          if(headerManager.beginHeader("Rasterizer"))
-            changed |= renderer.m_rasterizer.onUIRender(renderer.m_resources);
-        }
-      }
-      ImGui::Separator();
+      });
 
+      m_sceneBrowser.render(&m_resources.settings.showSceneBrowserWindow, m_busy.isBusy());
+      m_inspector.render(&m_resources.settings.showInspectorWindow, m_busy.isBusy());
 
-      if(headerManager.beginHeader("Environment"))
+      // Top-level so the "Add Primitive" modal surfaces even when the Scene Browser window is
+      // hidden/collapsed (e.g. triggered from the menu-bar "Create"). requestAddPrimitive() remains
+      // the trigger; this just renders the pending modal.
+      m_sceneBrowser.showAddPrimitivePopup();
+      // Same rationale for the image viewer: it can be opened from the inspector (thumbnail click), so
+      // render it here rather than inside the Scene Browser's tab body.
+      m_sceneBrowser.showImageViewer();
+    }
+
+#ifdef USE_AGENTIC
+    agentic::renderAgenticWindow(m_agentic, m_resources);
+#endif
+
+    if(m_resources.settings.showSettingsWindow)
+    {
+      if(frameCount < 2)  // This is a hack to make the settings window focus on the first frame
       {
+        ImGui::SetNextWindowFocus();
+        frameCount++;
+      }
+
+      if(ImGui::Begin("Settings", &m_resources.settings.showSettingsWindow))
+      {
+        nvgui::tooltip("Press F3 to toggle this window");
+        // Add renderer selection at the top level of the Settings panel for better visibility
         if(PE::begin())
         {
-          if(PE::Combo("Environment Type", (int*)&renderer.m_resources.settings.envSystem, "Sky\0HDR\0\0"))  // 0: Sky, 1: HDR
+          static const char* rendererItems[] = {"Path Tracer", "Rasterizer"};
+          int                currentItem     = static_cast<int>(m_resources.settings.renderSystem);
+          if(PE::Combo("Active Renderer", &currentItem, rendererItems, IM_ARRAYSIZE(rendererItems)))
           {
-            renderer.m_pathTracer.m_pushConst.fireflyClampThreshold =
-                (renderer.m_resources.settings.envSystem == shaderio::EnvSystem::eSky) ?
-                    10.0f :
-                    renderer.m_resources.hdrIbl.getIntegral();
-            changed |= true;
+            m_resources.settings.renderSystem = static_cast<RenderingMode>(currentItem);
+            changed                           = true;  // Reset frame counter when switching renderers
           }
-          changed |= PE::Checkbox("Solid Color", &renderer.m_resources.settings.useSolidBackground);
-          if(renderer.m_resources.settings.useSolidBackground)
-          {
-            changed |= PE::ColorEdit3("Background Color", glm::value_ptr(renderer.m_resources.settings.solidBackgroundColor));
-          }
+          changed |= PE::Combo("Visualization", (int32_t*)(&m_resources.settings.visualization),
+                               "Rendered\0BaseColor\0Metallic\0Roughness\0NormalShd\0NormalGeo\0Tangent\0Bitangent\0Emissive\0Opacity\0TexCoord0\0TexCoord1\0Clay\0TriangleID\0FaceOrientation\0"
+                               // Khronos glTF-Sample-Renderer DEBUG_* parity views (must match
+                               // the Visualization enum order in shaderio.h).
+                               "Occlusion\0Clearcoat Factor\0Clearcoat Roughness\0Clearcoat Normal\0"
+                               "Sheen Color\0Sheen Roughness\0Specular Factor\0Specular Color\0"
+                               "Transmission Factor\0Iridescence Factor\0Iridescence Thickness\0"
+                               "Anisotropy Strength\0Diffuse Transmission Factor\0Diffuse Transmission Color\0"
+                               // Opacity-micromap debug view (must match the Visualization enum order).
+                               "Opacity Micromap\0\0");
+          changed |= nvgui::hoverScrolling(*reinterpret_cast<int32_t*>(&m_resources.settings.visualization), 0,
+                                           int32_t(shaderio::Visualization::eOpacityMicromap));
+          changed |= PE::Checkbox("Wireframe", &m_resources.settings.wireframe, "Overlay wireframe on rendered meshes");
           PE::end();
-        }
-
-        if(renderer.m_resources.settings.envSystem == shaderio::EnvSystem::eHdr)
-        {
-          if(PE::begin("HDR"))
+          if(m_resources.settings.renderSystem == RenderingMode::ePathtracer)
           {
-            changed |= PE::SliderFloat("Intensity", &renderer.m_resources.settings.hdrEnvIntensity, 0, 100, "%.3f",
-                                       ImGuiSliderFlags_Logarithmic, "HDR intensity");
-            changed |= PE::SliderAngle("Rotation", &renderer.m_resources.settings.hdrEnvRotation, -360, 360, "%.0f deg",
-                                       0, "Rotating the environment");
-            changed |= PE::SliderFloat("Blur", &renderer.m_resources.settings.hdrBlur, 0, 1, "%.3f", 0, "Blur the environment");
-            PE::end();
-          }
-        }
-        else
-        {
-          changed |= nvgui::skyPhysicalParameterUI(renderer.m_resources.skyParams);
-        }
-      }
-
-      if(headerManager.beginHeader("Tonemapper"))
-      {
-        nvgui::tonemapperWidget(renderer.m_resources.tonemapperData);
-      }
-
-      // Multiple scenes
-      if(renderer.m_resources.scene.getModel().scenes.size() > 1)
-      {
-        if(headerManager.beginHeader("Multiple Scenes"))
-        {
-          ImGui::PushID("Scenes");
-          for(size_t i = 0; i < renderer.m_resources.scene.getModel().scenes.size(); i++)
-          {
-            if(ImGui::RadioButton(renderer.m_resources.scene.getModel().scenes[i].name.c_str(),
-                                  renderer.m_resources.scene.getCurrentScene() == i))
+            if(ImGui::CollapsingHeader("Path Tracer", ImGuiTreeNodeFlags_DefaultOpen))
             {
-              renderer.m_resources.scene.setCurrentScene(int(i));
-              vkDeviceWaitIdle(renderer.m_device);
-              renderer.createVulkanScene();
-              renderer.updateTextures();
-              changed = true;
+              changed |= m_pathTracer.onUIRender(m_resources);
             }
           }
-          ImGui::PopID();
-        }
-      }
-
-      // Variant selection
-      if(renderer.m_resources.scene.getVariants().size() > 0)
-      {
-        if(headerManager.beginHeader("Variants"))
-        {
-          ImGui::PushID("Variants");
-          for(size_t i = 0; i < renderer.m_resources.scene.getVariants().size(); i++)
+          else  // Rasterizer
           {
-            if(ImGui::Selectable(renderer.m_resources.scene.getVariants()[i].c_str(),
-                                 renderer.m_resources.scene.getCurrentVariant() == i))
+            if(ImGui::CollapsingHeader("Rasterizer", ImGuiTreeNodeFlags_DefaultOpen))
             {
-              renderer.m_resources.scene.setCurrentVariant(int(i));
-              renderer.m_resources.dirtyFlags.set(DirtyFlags::eVulkanScene);
-              changed = true;
+              changed |= m_rasterizer.onUIRender(m_resources);
             }
           }
-          ImGui::PopID();
         }
-      }
+        ImGui::Separator();
 
-      // Animation
-      if(renderer.m_resources.scene.hasAnimation())
-      {
-        if(headerManager.beginHeader("Animation"))
+        // Multiple scenes (glTF scenes within one file)
+        if(m_resources.getScene() && m_resources.getScene()->getModel().scenes.size() > 1)
         {
-          renderer.m_animControl.onUI(&renderer.m_resources.scene);
+          if(ImGui::CollapsingHeader("Multiple Scenes"))
+          {
+            ImGui::PushID("Scenes");
+            for(size_t i = 0; i < m_resources.getScene()->getModel().scenes.size(); i++)
+            {
+              if(ImGui::RadioButton(m_resources.getScene()->getModel().scenes[i].name.c_str(),
+                                    m_resources.getScene()->getCurrentScene() == i))
+              {
+                m_resources.getScene()->setCurrentScene(int(i));
+                // SYNC NOTE: User-initiated scene switch — wait before full GPU resource rebuild.
+                NVVK_CHECK(vkQueueWaitIdle(m_app->getQueue(0).queue));
+                createVulkanScene();
+                updateTextures();
+                changed = true;
+              }
+            }
+            ImGui::PopID();
+          }
         }
       }
+      ImGui::End();  // End Settings
 
-      if(renderer.m_resources.scene.valid() && headerManager.beginHeader("Statistics"))
-      {
-        if(PE::begin("Stat_Val"))
-        {
-          const tinygltf::Model& tiny = renderer.m_resources.scene.getModel();
-          PE::Text("Nodes", std::to_string(tiny.nodes.size()));
-          PE::Text("Render Nodes", std::to_string(renderer.m_resources.scene.getRenderNodes().size()));
-          PE::Text("Render Primitives", std::to_string(renderer.m_resources.scene.getNumRenderPrimitives()));
-          PE::Text("Materials", std::to_string(tiny.materials.size()));
-          PE::Text("Triangles", std::to_string(renderer.m_resources.scene.getNumTriangles()));
-          PE::Text("Lights", std::to_string(tiny.lights.size()));
-          PE::Text("Textures", std::to_string(tiny.textures.size()));
-          PE::Text("Images", std::to_string(tiny.images.size()));
-          PE::end();
-        }
-      }
+      if(changed)
+        resetFrame();
     }
-    ImGui::End();  // End Settings
-
-    if(changed)
-      renderer.resetFrame();
   }
 
 
@@ -346,17 +639,82 @@ void GltfRendererUI::renderUI(GltfRenderer& renderer)
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0F, 0.0F));
     ImGui::Begin("Viewport");
 
-    // Handle mouse clicks in the viewport
-    GltfRendererUI::mouseClickedInViewport(renderer);
+    // Camera smooth animation runs always
+    m_cameraManip->updateAnim();
 
-    // Display the G-Buffer tonemapped image
-    ImGui::Image(ImTextureID(renderer.m_resources.gBuffers.getDescriptorSet(Resources::eImgTonemapped)),
-                 ImGui::GetContentRegionAvail());
-
-    // Adding Axis at the bottom left corner of the viewport
-    if(renderer.m_resources.settings.showAxis)
+    // Camera orbit/pan/zoom only when gizmo is not capturing input
+    bool gizmoCapturedInput = m_visualHelpers.transform.isDragging();
+    if(!gizmoCapturedInput)
     {
-      nvgui::Axis(renderer.m_resources.cameraManip->getViewMatrix(), 25.f);
+      nvapp::ElementCamera::updateCamera(m_cameraManip, ImGui::GetCurrentWindow());
+    }
+
+    // Handle mouse clicks and gizmo interaction in the viewport
+    GltfRenderer::mouseClickedInViewport();
+
+    // Capture the cursor's viewport pixel position for KHR_interactivity hover detection
+    // (docs/interactivity.md Phase E). ImGui state (IsWindowHovered/GetCursorScreenPos) is only
+    // valid here, in the UI-render phase - onRender()'s later Vulkan-recording pass can't query
+    // it directly, so it's stashed on GltfRenderer for updateHoverState() to consume this frame.
+    GltfRenderer::updateHoverCursorPosition();
+
+    // Viewport-scoped keyboard shortcuts (only when hovered or focused)
+    if(ImGui::IsWindowHovered(ImGuiHoveredFlags_RootWindow) || ImGui::IsWindowFocused())
+    {
+      if(ImGui::IsKeyPressed(ImGuiKey_G, false))
+        m_resources.settings.showGrid = !m_resources.settings.showGrid;
+      if(ImGui::IsKeyPressed(ImGuiKey_T, false))
+        m_resources.settings.showGizmo = !m_resources.settings.showGizmo;
+      // Space toggles animation play/pause.
+      if(ImGui::IsKeyPressed(ImGuiKey_Space, false))
+      {
+        if(ui::animation::hasPlayableAnimation(m_resources.getScene()))
+          m_resources.animationControl.togglePlay();
+      }
+    }
+
+    // Display the tonemapped viewport image. The Animation Strip below is an
+    // overlay (drawn on top of the image), so the image uses the full content
+    // region and always matches what is displayed. Capture the
+    // image's top-left before drawing so we can anchor the overlay with no
+    // item-spacing fudge factor.
+    const ImVec2 imageTopLeft = ImGui::GetCursorScreenPos();
+    const ImVec2 imageSize    = ImGui::GetContentRegionAvail();
+    ImGui::Image(m_resources.tonemappedUi, imageSize);
+
+    // Black-viewport guard: with Environment Type = None there is no sky/HDR light. If the scene
+    // also has no punctual lights and no emissive materials, nothing is lit. Unless a Solid Color
+    // background is set (which still fills the frame), the viewport is fully black -- warn the user
+    // rather than leaving them staring at an empty frame.
+    if(m_resources.settings.envSystem == shaderio::EnvSystem::eNone && !m_resources.settings.useSolidBackground)
+    {
+      const nvvkgltf::Scene* scene = m_resources.getScene();
+      const bool hasLight = scene && (!scene->getRenderLights().empty() || m_resources.sceneVk.numEmissiveTriangles() > 0);
+      if(scene && !hasLight)
+        drawNoLightOverlay(imageTopLeft, imageSize);
+    }
+
+    // Axis gizmo: anchored to the 3D image's bottom-left, nudged up by one
+    // frame-height when the Animation Strip is showing so the two don't overlap.
+    const bool stripVisible = m_resources.animationControl.showStrip;
+    if(m_resources.settings.showAxis)
+    {
+      const float  axisSize   = 25.f;
+      const float  dpi        = ImGui::GetWindowDpiScale();
+      const ImVec2 windowPos  = ImGui::GetWindowPos();
+      const ImVec2 windowSize = ImGui::GetWindowSize();
+      const float  stripOff   = stripVisible ? ImGui::GetFrameHeight() : 0.0F;
+      const ImVec2 axisPos(windowPos.x + axisSize * 1.1F * dpi, windowPos.y + windowSize.y - stripOff - axisSize * 1.1F * dpi);
+      nvgui::Axis(axisPos, m_cameraManip->getViewMatrix(), axisSize);
+    }
+
+    // Animation Strip overlay: hover-reactive strip flush with the image's bottom.
+    if(stripVisible)
+    {
+      const float  h = ImGui::GetFrameHeight();
+      const ImVec2 stripTopLeft(imageTopLeft.x, imageTopLeft.y + imageSize.y - h);
+      ui::animation::renderStripOverlay(m_resources.getScene(), m_resources.animationControl, stripTopLeft,
+                                        ImVec2(imageSize.x, h));
     }
 
     ImGui::End();
@@ -365,123 +723,659 @@ void GltfRendererUI::renderUI(GltfRenderer& renderer)
 
 
   // Show the busy window if the busy flag is set
-  if(renderer.m_busy.isBusy())
+  if(m_busy.isBusy())
   {
-    renderer.m_busy.show();
+    m_busy.show();
+  }
+
+  // Display memory statistics window
+  renderMemoryStatistics();
+
+  // Display environment, tonemapper, and statistics windows
+  renderEnvironmentWindow();
+  renderTonemapperWindow();
+  renderStatisticsWindow();
+
+  if(m_resources.settings.showGridSettingsWindow)
+  {
+    if(ImGui::Begin(ICON_MS_GRID_VIEW " Grid & Snap", &m_resources.settings.showGridSettingsWindow))
+    {
+      Settings& s = m_resources.settings;
+      if(PE::begin())
+      {
+        PE::DragFloat("Grid Unit", &s.gridUnit, 0.01f, 0.001f, 1000.0f, "%.3f");
+        ImGui::Separator();
+        PE::Checkbox("Enable Snapping", &s.snapEnabled);
+        ImGui::BeginDisabled(!s.snapEnabled);
+        PE::Text("Translation", "%.3f (= Grid Unit)", s.gridUnit);
+        PE::DragFloat("Rotation (deg)", &s.snapRotation, 1.0f, 1.0f, 180.0f, "%.1f");
+        PE::DragFloat("Scale", &s.snapScale, 0.01f, 0.001f, 10.0f, "%.3f");
+        ImGui::EndDisabled();
+        PE::end();
+      }
+    }
+    ImGui::End();
+  }
+
+#ifndef NDEBUG
+  if(m_resources.settings.showGridStyleWindow)
+  {
+    if(ImGui::Begin("Grid Style", &m_resources.settings.showGridStyleWindow))
+    {
+      GridHelperVk::onDebugUI(m_visualHelpers.grid.style());
+    }
+    ImGui::End();
+  }
+  if(m_resources.settings.showGizmoStyleWindow)
+  {
+    if(ImGui::Begin("Gizmo Style", &m_resources.settings.showGizmoStyleWindow))
+    {
+      TransformHelperVk::onDebugUI(m_visualHelpers.transform.style());
+    }
+    ImGui::End();
+  }
+#endif
+
+  // Application-level delete confirmation (works regardless of which windows are open)
+  if(m_openDeletePopupNextFrame)
+  {
+    ImGui::OpenPopup("DeleteConfirmation");
+    m_openDeletePopupNextFrame = false;
+  }
+  if(ImGui::BeginPopupModal("DeleteConfirmation", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+  {
+    if(m_pendingDeleteNode >= 0 && m_resources.getScene()
+       && m_pendingDeleteNode < static_cast<int>(m_resources.getScene()->getModel().nodes.size()))
+    {
+      const tinygltf::Model& model = m_resources.getScene()->getModel();
+      ImGui::Text("Delete node '%s'?", model.nodes[m_pendingDeleteNode].name.c_str());
+
+      const auto& gpuInstMap = m_resources.getScene()->getGpuInstanceLocalMatrices();
+      auto        instIt     = gpuInstMap.find(m_pendingDeleteNode);
+      if(instIt != gpuInstMap.end() && !instIt->second.empty())
+      {
+        ImGui::TextColored(ImVec4(1.f, 0.6f, 0.2f, 1.f),
+                           ICON_MS_WARNING
+                           " This node uses EXT_mesh_gpu_instancing (%zu instances).\n"
+                           "Deleting it will remove ALL instances.",
+                           instIt->second.size());
+      }
+
+      ImGui::Text("This will delete the node and all its children.");
+      ImGui::Text("You can undo this with Ctrl+Z.");
+      ImGui::Separator();
+
+      if(ImGui::Button(ICON_MS_DELETE " Delete###confirmDelete", ImVec2(120, 0)))  // ### id for UI-test scenarios
+      {
+        auto cmd = std::make_unique<DeleteNodeCommand>(*m_resources.getScene(), m_pendingDeleteNode, &m_sceneSelection);
+        m_undoStack.executeCommand(std::move(cmd));
+        m_pendingDeleteNode = -1;
+        onUndoRedo();
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SameLine();
+      if(ImGui::Button(ICON_MS_CANCEL " Cancel", ImVec2(120, 0)))
+      {
+        m_pendingDeleteNode = -1;
+        ImGui::CloseCurrentPopup();
+      }
+    }
+    else
+    {
+      ImGui::Text("Nothing to delete.");
+      if(ImGui::Button("Close", ImVec2(120, 0)))
+      {
+        m_pendingDeleteNode = -1;
+        ImGui::CloseCurrentPopup();
+      }
+    }
+    ImGui::EndPopup();
   }
 }
 
-void GltfRendererUI::renderMenu(GltfRenderer& renderer)
+void GltfRenderer::renderFileMenu(bool                   validScene,
+                                  bool&                  newScene,
+                                  bool&                  openFile,
+                                  bool&                  mergeFile,
+                                  bool&                  loadHdrFile,
+                                  bool&                  saveFile,
+                                  bool&                  saveAsFile,
+                                  bool&                  saveSelfContainedAsFile,
+                                  bool&                  saveScreenFile,
+                                  bool&                  saveImageFile,
+                                  bool&                  referenceFile,
+                                  bool&                  closeApp,
+                                  std::filesystem::path& sceneToLoadFilename,
+                                  std::filesystem::path& sceneToMergeFilename)
 {
-  bool v_sync = renderer.m_app->isVsync();
-
-  auto getSaveImage = [&]() {
-    std::filesystem::path filename =
-        nvgui::windowSaveFileDialog(renderer.m_app->getWindowHandle(), "Save Image", "PNG(.png),JPG(.jpg)|*.png;*.jpg");
-    if(!filename.empty())
+  if(!ImGui::BeginMenu("File"))
+    return;
+  newScene = ImGui::MenuItem(ICON_MS_FILTER_NONE " New Scene", "Ctrl+N");
+  openFile |= ImGui::MenuItem(ICON_MS_FILE_OPEN " Open", "Ctrl+O");
+  // Import/Merge and Reference always available: with no scene they create one from the imported file
+  // (addSceneFromFile builds a fresh Scene), otherwise they add into the current scene.
+  mergeFile |= ImGui::MenuItem(ICON_MS_ADD " Import/Merge Scene...");
+  nvgui::tooltip("Embed another glTF into this scene, or open it as a new scene if none is loaded");
+  referenceFile |= ImGui::MenuItem(ICON_MS_LINK " Reference Scene...");
+  nvgui::tooltip("Link another glTF as a read-only external asset (glTF 2.1). Repeats share geometry; kept as a reference on save");
+  loadHdrFile |= ImGui::MenuItem(ICON_MS_IMAGE " Load HDR Environment", "Ctrl+Shift+O");
+  if(ImGui::BeginMenu(ICON_MS_HISTORY " Open Recent"))
+  {
+    for(const auto& file : m_recentFiles)
     {
-      std::filesystem::path ext = std::filesystem::path(filename).extension();
+      if(ImGui::MenuItem(file.string().c_str()))
+        sceneToLoadFilename = file;
     }
-    return filename;
+    ImGui::EndMenu();
+  }
+  ImGui::BeginDisabled(!validScene);
+  saveFile |= ImGui::MenuItem(ICON_MS_SAVE " Save", "Ctrl+S");
+  saveAsFile |= ImGui::MenuItem(ICON_MS_FILE_SAVE " Save As...", "Ctrl+Shift+S");
+  // glTF 2.1: only meaningful when the scene references external assets. Bakes them inline and
+  // drops all references, producing a portable file that can be shared without the referenced files.
+  if(validScene && m_resources.getScene()->hasExternalAssets())
+  {
+    saveSelfContainedAsFile |= ImGui::MenuItem(ICON_MS_FILE_SAVE " Save Self-Contained As...");
+    nvgui::tooltip("Bake referenced external assets into the file and remove all external references (shareable copy)");
+  }
+  ImGui::EndDisabled();
+  ImGui::Separator();
+  saveImageFile |= ImGui::MenuItem(ICON_MS_IMAGE " Save Image", "Ctrl+Alt+I");
+  saveScreenFile |= ImGui::MenuItem(ICON_MS_DESKTOP_WINDOWS " Save Screen Image", "Ctrl+Alt+Shift+I");
+  ImGui::Separator();
+  closeApp |= ImGui::MenuItem(ICON_MS_POWER_SETTINGS_NEW " Exit", "Ctrl+Q");
+  ImGui::EndMenu();
+}
+
+void GltfRenderer::renderEditMenu(bool validScene)
+{
+  if(!ImGui::BeginMenu("Edit"))
+    return;
+
+  ImGui::BeginDisabled(!validScene || !m_undoStack.canUndo());
+  std::string undoLabel = m_undoStack.canUndo() ? ICON_MS_UNDO " Undo " + m_undoStack.undoDescription() : ICON_MS_UNDO " Undo";
+  if(ImGui::MenuItem(undoLabel.c_str(), "Ctrl+Z"))
+  {
+    m_undoStack.undo();
+    onUndoRedo();
+  }
+  ImGui::EndDisabled();
+
+  ImGui::BeginDisabled(!validScene || !m_undoStack.canRedo());
+  std::string redoLabel = m_undoStack.canRedo() ? ICON_MS_REDO " Redo " + m_undoStack.redoDescription() : ICON_MS_REDO " Redo";
+  if(ImGui::MenuItem(redoLabel.c_str(), "Ctrl+Y"))
+  {
+    m_undoStack.redo();
+    onUndoRedo();
+  }
+  ImGui::EndDisabled();
+
+  auto selectionNodeIndex = [this, validScene]() -> int {
+    if(!validScene || !m_sceneSelection.hasSelection())
+      return -1;
+    auto sel = m_sceneSelection.getSelection();
+    if((sel.type == SceneSelection::SelectionType::eNode || sel.type == SceneSelection::SelectionType::ePrimitive)
+       && sel.nodeIndex >= 0)
+      return sel.nodeIndex;
+    return -1;
   };
 
-  GltfRendererUI::windowTitle(renderer);
-  bool loadFile       = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O);
-  bool saveFile       = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S);
-  bool saveScreenFile = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiMod_Alt | ImGuiKey_S);
-  bool saveImageFile  = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S);
-  bool closeApp       = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Q);
-  bool fitScene       = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_F);
-  bool fitObject      = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F);
-  bool toggleVsyc     = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_V);
-  bool reloadShader   = ImGui::IsKeyPressed(ImGuiKey_F5);
-
-  if(toggleVsyc)
+  bool hasNodeSelected = selectionNodeIndex() >= 0;
+  ImGui::Separator();
+  ImGui::BeginDisabled(!hasNodeSelected);
+  if(ImGui::MenuItem(ICON_MS_CONTENT_COPY " Duplicate", "Ctrl+D"))
   {
-    v_sync = !v_sync;
+    int  nodeIdx = selectionNodeIndex();
+    auto cmd     = std::make_unique<DuplicateNodeCommand>(*m_resources.getScene(), nodeIdx, &m_sceneSelection);
+    m_undoStack.executeCommand(std::move(cmd));
+    onUndoRedo();
   }
-  bool validScene = renderer.m_resources.scene.valid();
-  if(ImGui::BeginMenu("File"))
+  if(ImGui::MenuItem(ICON_MS_DELETE " Delete", "Del"))
   {
-    loadFile |= ImGui::MenuItem("Load", "Ctrl+O");
-    ImGui::BeginDisabled(!validScene);  // Disable menu item if no scene is loaded
-    saveFile |= ImGui::MenuItem("Save As", "Ctrl+S");
-    ImGui::EndDisabled();
+    m_pendingDeleteNode        = selectionNodeIndex();
+    m_openDeletePopupNextFrame = true;
+  }
+  ImGui::EndDisabled();
+
+  ImGui::EndMenu();
+}
+
+void GltfRenderer::renderCreateMenu()
+{
+  if(!ImGui::BeginMenu("Create"))
+    return;
+
+  // Global creation: always adds at the scene root (never under the current selection). Each catalog
+  // action runs the browser's before-create hook (ensureEmptyScene), so "Create" works with nothing
+  // loaded; the first object then triggers the initial GPU build via reconcileGeometryIfNeeded().
+  m_sceneBrowser.renderCreateCatalog(-1);
+
+  ImGui::EndMenu();
+}
+
+void GltfRenderer::renderViewMenu(bool validScene, bool& fitScene, bool& fitObject, bool& toggleVsync)
+{
+  if(!ImGui::BeginMenu("View"))
+    return;
+  ImGui::BeginDisabled(!validScene);
+  fitScene |= ImGui::MenuItem(ICON_MS_ZOOM_OUT " Fit Scene", "Ctrl+Shift+F");
+  ImGui::BeginDisabled(m_resources.selectedRenderNodes.empty());
+  fitObject |= ImGui::MenuItem(ICON_MS_ZOOM_IN " Fit Object", "Ctrl+F");
+  ImGui::EndDisabled();
+  ImGui::EndDisabled();
+  ImGui::Separator();
+  ImGui::MenuItem(ICON_MS_BOTTOM_PANEL_OPEN " V-Sync", "Ctrl+Shift+V", &toggleVsync);
+  ImGui::MenuItem(ICON_MS_VIEW_IN_AR " 3D-Axis", nullptr, &m_resources.settings.showAxis);
+  ImGui::Separator();
+  ImGui::MenuItem(ICON_MS_GRID_ON " Grid", "G", &m_resources.settings.showGrid);
+  ImGui::MenuItem(ICON_MS_3D_ROTATION " Gizmo", "T", &m_resources.settings.showGizmo);
+  ImGui::MenuItem(ICON_MS_STRAIGHTEN " Snap", nullptr, &m_resources.settings.snapEnabled);
+  ImGui::MenuItem(ICON_MS_MOVIE " Animation Strip", nullptr, &m_resources.animationControl.showStrip);
+  ImGui::Separator();
+  ImGui::MenuItem(ICON_MS_GRID_VIEW " Grid & Snap Settings...", nullptr, &m_resources.settings.showGridSettingsWindow);
+  ImGui::EndMenu();
+}
+
+void GltfRenderer::renderWindowsMenu()
+{
+  struct WindowToggleInfo
+  {
+    const char* icon;
+    const char* name;
+    const char* shortcut;
+    bool*       visible;
+  };
+  static const std::array<WindowToggleInfo, 7 + kAgenticToggleCount> toggles = {{
+      {ICON_MS_PHOTO_CAMERA, "Camera", "F1", &m_resources.settings.showCameraWindow},
+      {ICON_MS_ACCOUNT_TREE, "Scene Browser", "F2", &m_resources.settings.showSceneBrowserWindow},
+      {ICON_MS_SETTINGS, "Settings", "F3", &m_resources.settings.showSettingsWindow},
+      {ICON_MS_LIST_ALT, "Inspector", "F4", &m_resources.settings.showInspectorWindow},
+      {ICON_MS_PUBLIC, "Environment", "F5", &m_resources.settings.showEnvironmentWindow},
+      {ICON_MS_TONALITY, "Tonemapper", "F6", &m_resources.settings.showTonemapperWindow},
+      {ICON_MS_EXTENSION, "Interactivity", "F8", &m_resources.settings.showInteractivityWindow},
+#ifdef USE_AGENTIC
+      {ICON_MS_AUTO_AWESOME, "Agentic", "F7", &m_resources.settings.showAgenticWindow},
+#endif
+  }};
+  if(!ImGui::BeginMenu("Windows"))
+    return;
+  for(const auto& t : toggles)
+  {
+    std::string label = std::string(t.icon) + " " + t.name;
+    ImGui::MenuItem(label.c_str(), t.shortcut, t.visible);
+  }
+  ImGui::MenuItem(ICON_MS_ANALYTICS " Statistics", nullptr, &m_resources.settings.showStatisticsWindow);
+  ImGui::MenuItem(ICON_MS_GRID_VIEW " Grid & Snap", nullptr, &m_resources.settings.showGridSettingsWindow);
+  ImGui::Separator();
+  ImGui::MenuItem(ICON_MS_MONITORING " Memory Usage", nullptr, &m_resources.settings.showMemStats);
+  ImGui::EndMenu();
+}
+
+// (The Agentic feature has no top-level menu; its window is toggled from the
+//  Windows menu / F7 and rendered by agentic::renderAgenticWindow in ui_agentic.cpp.)
+
+void GltfRenderer::renderToolsMenu(bool validScene, bool& reloadShader, bool& compactScene)
+{
+  if(!ImGui::BeginMenu("Tools"))
+    return;
+  reloadShader |= ImGui::MenuItem(ICON_MS_REFRESH " Reload Shaders", "Ctrl+Shift+R");
+  ImGui::Separator();
+  ImGui::BeginDisabled(!validScene);
+  if(ImGui::MenuItem(ICON_MS_BUILD " Recreate Tangents - Simple"))
+  {
+    SCOPED_BANNER("Recreate Tangents - Simple");
+    recomputeTangents(m_resources.getScene()->getModel(), true, false);
+    m_resources.dirtyFlags.set(DirtyFlags::eDirtyTangents);
+  }
+  ImGui::SetItemTooltip("This recreate tangents using UV gradient method");
+  if(ImGui::MenuItem(ICON_MS_BUILD " Recreate Tangents - MikkTSpace"))
+  {
+    bool buffersChanged = false;
+    {
+      SCOPED_BANNER("Recreate Tangents - MikkTSpace");
+      buffersChanged = recomputeTangents(m_resources.getScene()->getModel(), true, true);
+    }
+    if(buffersChanged)
+      rebuildSceneFromModel();
+    else
+      m_resources.dirtyFlags.set(DirtyFlags::eDirtyTangents);
+  }
+  ImGui::SetItemTooltip("Recreate tangents using MikkTSpace (may split vertices at UV seams)");
+  ImGui::Separator();
+  compactScene |= ImGui::MenuItem(ICON_MS_COMPRESS " Compact Scene", "Ctrl+K");
+  ImGui::SetItemTooltip(
+      "Remove orphaned resources (meshes, materials, textures, images, geometry).\n"
+      "Use after deleting nodes or importing/merging scenes.");
+  ImGui::EndDisabled();
+  ImGui::EndMenu();
+}
+
+void GltfRenderer::renderDebugMenu()
+{
+#ifndef NDEBUG
+  if(ImGui::BeginMenu("Debug"))
+  {
+    ImGui::MenuItem("Grid Style", nullptr, &m_resources.settings.showGridStyleWindow);
+    ImGui::MenuItem("Gizmo Style", nullptr, &m_resources.settings.showGizmoStyleWindow);
     ImGui::Separator();
-    saveImageFile |= ImGui::MenuItem("Save Image", "Ctrl+Shift+S");
-    saveScreenFile |= ImGui::MenuItem("Save Screen", "Ctrl+Alt+Shift+S");
-    ImGui::Separator();
-    closeApp |= ImGui::MenuItem("Exit", "Ctrl+Q");
+    ImGui::MenuItem("GPU Compute Animation", nullptr, &m_resources.sceneGpu.useComputeAnimation);
+    ImGui::MenuItem("GPU Compute Transformation", nullptr, &m_resources.sceneGpu.useComputeTransformation);
     ImGui::EndMenu();
   }
+#endif
+}
 
-  // De-selecting the object
+void GltfRenderer::renderMenuToolbarAndGizmos()
+{
+  struct WindowToggleInfo
+  {
+    const char* icon;
+    const char* shortcut;
+    bool*       visible;
+    const char* tooltip;
+  };
+  static const std::array<WindowToggleInfo, 6 + kAgenticToggleCount> windowToggles = {{
+      {ICON_MS_PHOTO_CAMERA, "F1", &m_resources.settings.showCameraWindow, "Camera"},
+      {ICON_MS_ACCOUNT_TREE, "F2", &m_resources.settings.showSceneBrowserWindow, "Scene Browser"},
+      {ICON_MS_SETTINGS, "F3", &m_resources.settings.showSettingsWindow, "Settings"},
+      {ICON_MS_LIST_ALT, "F4", &m_resources.settings.showInspectorWindow, "Inspector"},
+      {ICON_MS_PUBLIC, "F5", &m_resources.settings.showEnvironmentWindow, "Environment"},
+      {ICON_MS_TONALITY, "F6", &m_resources.settings.showTonemapperWindow, "Tonemapper"},
+#ifdef USE_AGENTIC
+      {ICON_MS_AUTO_AWESOME, "F7", &m_resources.settings.showAgenticWindow, "Agentic"},
+#endif
+  }};
+  float             buttonSize     = ImGui::GetFrameHeight();
+  const ImGuiStyle& style          = ImGui::GetStyle();
+  float             separatorWidth = 2.0f;
+  float totalWidth  = separatorWidth + static_cast<float>(windowToggles.size()) * (buttonSize + style.ItemSpacing.x);
+  float windowWidth = ImGui::GetWindowWidth();
+  float offsetX     = windowWidth * 0.5f - totalWidth * 0.5f;
+  ImGui::SameLine(offsetX);
+  ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+  ImGui::SameLine();
+  for(size_t i = 0; i < windowToggles.size(); ++i)
+  {
+    const auto& toggle = windowToggles[i];
+    ImVec4      buttonColor =
+        *toggle.visible ? ImGui::GetStyle().Colors[ImGuiCol_ButtonActive] : ImGui::GetStyle().Colors[ImGuiCol_ChildBg];
+    ImGui::PushStyleColor(ImGuiCol_Button, buttonColor);
+    if(ImGui::Button(toggle.icon))
+      *toggle.visible = !*toggle.visible;
+    ImGui::PopStyleColor();
+    if(ImGui::IsItemHovered())
+      ImGui::SetTooltip("Toggle %s Window (%s)", toggle.tooltip, toggle.shortcut);
+    if(i < windowToggles.size() - 1)
+      ImGui::SameLine(0, 0);
+  }
+  ImGui::SameLine();
+  ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+  ImGui::SameLine();
+  struct GizmoToggle
+  {
+    const char* icon;
+    const char* tooltip;
+    const char* shortcut;
+    bool*       visible;
+  };
+  GizmoToggle gizmoToggles[] = {
+      {ICON_MS_GRID_ON, "Grid", "G", &m_resources.settings.showGrid},
+      {ICON_MS_3D_ROTATION, "Gizmo", "T", &m_resources.settings.showGizmo},
+      {ICON_MS_STRAIGHTEN, "Snap", nullptr, &m_resources.settings.snapEnabled},
+      {ICON_MS_MOVIE, "Animation Strip", nullptr, &m_resources.animationControl.showStrip},
+  };
+  for(size_t i = 0; i < std::size(gizmoToggles); ++i)
+  {
+    const auto& toggle = gizmoToggles[i];
+    ImVec4      buttonColor =
+        *toggle.visible ? ImGui::GetStyle().Colors[ImGuiCol_ButtonActive] : ImGui::GetStyle().Colors[ImGuiCol_ChildBg];
+    ImGui::PushStyleColor(ImGuiCol_Button, buttonColor);
+    if(ImGui::Button(toggle.icon, ImVec2(buttonSize, buttonSize)))
+      *toggle.visible = !*toggle.visible;
+    ImGui::PopStyleColor();
+    if(ImGui::IsItemHovered())
+    {
+      if(toggle.shortcut)
+        ImGui::SetTooltip("Toggle %s (%s in viewport)", toggle.tooltip, toggle.shortcut);
+      else
+        ImGui::SetTooltip("Toggle %s", toggle.tooltip);
+    }
+    if(i < std::size(gizmoToggles) - 1)
+      ImGui::SameLine(0, 0);
+  }
+
+  // KHR_interactivity Play/Pause indicator - only drawn when the loaded scene actually has a graph
+  // (unlike the toggles above, which are always present). Toggles InteractivityControl::play
+  // directly; does not open the Interactivity window (View > Windows > Interactivity, or F8).
+  if(ui::interactivity::hasGraph(m_resources.getScene()))
+  {
+    ImGui::SameLine(0, 0);
+    ui::interactivity::renderToolbarIndicator(m_resources.getScene(), m_resources.interactivityControl);
+  }
+
+  ImGui::SameLine();
+  ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+}
+
+void GltfRenderer::renderMenu()
+{
+  bool v_sync = m_app->isVsync();
+  struct WindowToggleInfo
+  {
+    const char* icon;
+    const char* name;
+    const char* shortcut;
+    ImGuiKey    key;
+    bool        useShift;
+    bool*       visible;
+    const char* tooltip;
+  };
+  static const std::array<WindowToggleInfo, 7 + kAgenticToggleCount> windowToggles = {{
+      {ICON_MS_PHOTO_CAMERA, "Camera", "F1", ImGuiKey_F1, false, &m_resources.settings.showCameraWindow, "Camera"},
+      {ICON_MS_ACCOUNT_TREE, "Scene Browser", "F2", ImGuiKey_F2, false, &m_resources.settings.showSceneBrowserWindow, "Scene Browser"},
+      {ICON_MS_SETTINGS, "Settings", "F3", ImGuiKey_F3, false, &m_resources.settings.showSettingsWindow, "Settings"},
+      {ICON_MS_LIST_ALT, "Inspector", "F4", ImGuiKey_F4, false, &m_resources.settings.showInspectorWindow, "Inspector"},
+      {ICON_MS_PUBLIC, "Environment", "F5", ImGuiKey_F5, false, &m_resources.settings.showEnvironmentWindow, "Environment"},
+      {ICON_MS_TONALITY, "Tonemapper", "F6", ImGuiKey_F6, false, &m_resources.settings.showTonemapperWindow, "Tonemapper"},
+      {ICON_MS_EXTENSION, "Interactivity", "F8", ImGuiKey_F8, false, &m_resources.settings.showInteractivityWindow, "Interactivity"},
+#ifdef USE_AGENTIC
+      {ICON_MS_AUTO_AWESOME, "Agentic", "F7", ImGuiKey_F7, false, &m_resources.settings.showAgenticWindow, "Agentic"},
+#endif
+  }};
+  for(const auto& toggle : windowToggles)
+  {
+    if(toggle.useShift)
+    {
+      if(ImGui::IsKeyChordPressed(ImGuiMod_Shift | toggle.key))
+        *toggle.visible = !*toggle.visible;
+    }
+    else if(toggle.key != ImGuiKey_None && ImGui::IsKeyPressed(toggle.key))
+      *toggle.visible = !*toggle.visible;
+  }
+  std::filesystem::path sceneToLoadFilename{};
+  std::filesystem::path sceneToMergeFilename{};
+  GltfRenderer::windowTitle();
+  bool newScene                = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_N);
+  bool openFile                = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O);
+  bool mergeFile               = false;
+  bool referenceFile           = false;
+  bool loadHdrFile             = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_O);
+  bool saveFile                = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S);
+  bool saveAsFile              = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S);
+  bool saveSelfContainedAsFile = false;
+  bool saveScreenFile          = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiMod_Alt | ImGuiKey_I);
+  bool saveImageFile           = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_I);
+  bool closeApp                = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Q);
+  bool fitScene                = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_F);
+  bool fitObject               = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F);
+  bool toggleVsyc              = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_V);
+  bool reloadShader            = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_R);
+  bool compactScene            = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_K);
+  bool undoCmd                 = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z);
+  bool redoCmd                 = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y);
+  bool duplicateCmd            = ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D);
+  bool deleteCmd               = !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Delete, false);
+  if(toggleVsyc)
+    v_sync = !v_sync;
+  bool validScene = m_resources.getScene() && m_resources.getScene()->valid();
+
+  renderFileMenu(validScene, newScene, openFile, mergeFile, loadHdrFile, saveFile, saveAsFile, saveSelfContainedAsFile,
+                 saveScreenFile, saveImageFile, referenceFile, closeApp, sceneToLoadFilename, sceneToMergeFilename);
+  renderEditMenu(validScene);
+  renderCreateMenu();
+
   if(ImGui::IsKeyPressed(ImGuiKey_Escape))
   {
-    renderer.m_resources.selectedObject = -1;
-    renderer.m_uiSceneGraph.selectNode(-1);
+    m_resources.selectedRenderNodes.clear();
+    m_sceneSelection.clearSelection();
   }
 
-  if(ImGui::BeginMenu("View"))
+  if(undoCmd && m_undoStack.canUndo())
   {
-    ImGui::BeginDisabled(!validScene);  // Disable menu item if no scene is loaded)
-    fitScene |= ImGui::MenuItem("Fit Scene", "Ctrl+Shift+F");
-    ImGui::BeginDisabled(renderer.m_resources.selectedObject < 0);  // Disable menu item if no object is selected
-    fitObject |= ImGui::MenuItem("Fit Object", "Ctrl+F");
-    ImGui::EndDisabled();
-    ImGui::EndDisabled();
-    ImGui::Separator();
-    ImGui::MenuItem("V-Sync", "Ctrl+Shift+V", &v_sync);
-    ImGui::MenuItem("3D-Axis", nullptr, &renderer.m_resources.settings.showAxis);
-    ImGui::EndMenu();
+    m_undoStack.undo();
+    onUndoRedo();
+  }
+  if(redoCmd && m_undoStack.canRedo())
+  {
+    m_undoStack.redo();
+    onUndoRedo();
   }
 
-  if(ImGui::BeginMenu("Tools"))
+  // Duplicate / Delete selected node (global shortcuts; works with both node and primitive selections)
+  if(validScene && m_sceneSelection.hasSelection())
   {
-    reloadShader |= ImGui::MenuItem("Reload Shaders", "F5");
-    ImGui::Separator();
-    ImGui::BeginDisabled(!validScene);  // Disable menu item if no scene is loaded)
-
-    if(ImGui::MenuItem("Recreate Tangents - Simple"))
+    auto sel = m_sceneSelection.getSelection();
+    int nodeIdx = (sel.type == SceneSelection::SelectionType::eNode || sel.type == SceneSelection::SelectionType::ePrimitive) ?
+                      sel.nodeIndex :
+                      -1;
+    if(nodeIdx >= 0)
     {
-      recomputeTangents(renderer.m_resources.scene.getModel(), true, false);
-      renderer.m_resources.dirtyFlags.set(DirtyFlags::eVulkanScene);
+      if(duplicateCmd)
+      {
+        auto cmd = std::make_unique<DuplicateNodeCommand>(*m_resources.getScene(), nodeIdx, &m_sceneSelection);
+        m_undoStack.executeCommand(std::move(cmd));
+        onUndoRedo();
+      }
+      if(deleteCmd)
+      {
+        m_pendingDeleteNode        = nodeIdx;
+        m_openDeletePopupNextFrame = true;
+      }
     }
-    ImGui::SetItemTooltip("This recreate all tangents using MikkTSpace");
-    if(ImGui::MenuItem("Recreate Tangents - MikkTSpace"))
-    {
-      recomputeTangents(renderer.m_resources.scene.getModel(), true, true);
-      renderer.m_resources.dirtyFlags.set(DirtyFlags::eVulkanScene);
-    }
+  }
 
+  renderViewMenu(validScene, fitScene, fitObject, v_sync);
+  renderWindowsMenu();
+  renderToolsMenu(validScene, reloadShader, compactScene);
+  renderDebugMenu();
+  renderMenuToolbarAndGizmos();
 
-    ImGui::SetItemTooltip("This fixes NULL tangents");
-    ImGui::EndDisabled();
+  // Shared "Save As"-style dialog wrapper: opens with defaultPath pre-filled and, if given a
+  // remember-slot, updates it with the user's choice so later saves keep offering that name.
+  auto saveFileDialog = [this](const char* title, const char* filter, const std::filesystem::path& defaultPath,
+                               std::filesystem::path* rememberInto = nullptr) {
+    std::filesystem::path filename = nvgui::windowSaveFileDialog(m_app->getWindowHandle(), title, filter, defaultPath);
+    if(!filename.empty() && rememberInto)
+      *rememberInto = filename;
+    return filename;
+  };
+  auto isGltfExt = [](const std::filesystem::path& p) {
+    return nvutils::extensionMatches(p, ".gltf") || nvutils::extensionMatches(p, ".glb");
+  };
 
-    ImGui::EndMenu();
+  auto getSaveImage = [this, &saveFileDialog]() {
+    return saveFileDialog("Save Image", "Image Files|*.png;*.jpg;*.hdr|PNG Files|*.png|JPG Files|*.jpg|HDR Files|*.hdr",
+                          m_imageSaveFilename, &m_imageSaveFilename);
+  };
+
+  if(newScene)
+  {
+    // SYNC NOTE: User-initiated new scene — wait before full cleanup.
+    vkQueueWaitIdle(m_app->getQueue(0).queue);
+    cleanupScene();
+    m_sceneSelection.clearSelection();
+    m_imageSaveFilename.clear();
   }
 
   if(reloadShader)
   {
-    vkQueueWaitIdle(renderer.m_app->getQueue(0).queue);
-    renderer.compileShaders();
-    renderer.resetFrame();
+    SCOPED_BANNER("Reload Shaders");
+    // SYNC NOTE: User-initiated shader recompile (Ctrl-Shift-R) — wait before destroying old pipelines.
+    vkQueueWaitIdle(m_app->getQueue(0).queue);
+    compileShaders();
+    resetFrame();
   }
 
-  if(loadFile)
+  if(openFile)
   {
-    std::filesystem::path filename = nvgui::windowOpenFileDialog(renderer.m_app->getWindowHandle(), "Load glTF | HDR",
-                                                                 "glTF(.gltf, .glb), OBJ(.obj), "
-                                                                 "HDR(.hdr)|*.gltf;*.glb;*.obj;*.hdr");
-    renderer.onFileDrop(filename.c_str());
+    sceneToLoadFilename = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Load 3D Scene",
+                                                      "3D Scene Files|*.gltf;*.glb;*.obj;*.scene.json|glTF|*.gltf;*.glb|OBJ|*.obj|Scene Descriptor|*.scene.json",
+                                                      m_lastSceneDirectory);
+  }
+  if(!sceneToLoadFilename.empty())
+  {
+    onFileDrop(sceneToLoadFilename.c_str());
+  }
+
+  if(mergeFile)
+  {
+    sceneToMergeFilename = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Import/Merge Scene",
+                                                       "3D Scene Files|*.gltf;*.glb|glTF Text|*.gltf|glTF Binary|*.glb",
+                                                       m_lastSceneDirectory);
+  }
+  if(!sceneToMergeFilename.empty())
+  {
+    onMergeScene(sceneToMergeFilename);
+    sceneToMergeFilename.clear();
+  }
+
+  if(referenceFile)
+  {
+    std::filesystem::path filename =
+        nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Reference Scene (External Asset)",
+                                    "glTF Files|*.gltf;*.glb|glTF Text|*.gltf|glTF Binary|*.glb", m_lastSceneDirectory);
+    if(!filename.empty())
+      onReferenceScene(filename);
+  }
+
+  if(loadHdrFile)
+  {
+    loadHdrFileDialog();
   }
 
   if(saveFile && validScene)
   {
-    std::filesystem::path filename =
-        nvgui::windowSaveFileDialog(renderer.m_app->getWindowHandle(), "Save glTF", "glTF(.gltf, .glb)|*.gltf;*.glb");
+    // "Save": write directly to the current scene file when it is a glTF/glb we can overwrite.
+    // Otherwise (no path yet, or a non-glTF source like .obj/.scene.json) fall back to "Save As".
+    const std::filesystem::path& currentFilename = m_resources.getScene()->getFilename();
+    if(!currentFilename.empty() && isGltfExt(currentFilename))
+      save(currentFilename);
+    else
+      saveAsFile = true;
+  }
+
+  // Default filename offered by the "Save As" dialogs: the current scene file when it's already a
+  // glTF/glb we can round-trip, otherwise the loaded file's stem with a .gltf extension (e.g. after
+  // loading an .obj) — matches getSaveImage()'s "default name follows the loaded scene" behavior.
+  auto getSceneDefaultFilename = [this, &isGltfExt]() {
+    const std::filesystem::path& currentFilename = m_resources.getScene()->getFilename();
+    return isGltfExt(currentFilename) ? currentFilename : std::filesystem::path(currentFilename.stem()).replace_extension(".gltf");
+  };
+  static constexpr const char* kGltfFilter = "glTF Files|*.gltf;*.glb|glTF Text|*.gltf|glTF Binary|*.glb";
+
+  if(saveAsFile && validScene)
+  {
+    std::filesystem::path filename = saveFileDialog("Save glTF", kGltfFilter, getSceneDefaultFilename());
     if(!filename.empty())
-      renderer.save(filename);
+      save(filename);
+  }
+
+  if(saveSelfContainedAsFile && validScene)
+  {
+    // glTF 2.1: write a portable copy with external assets baked inline (no external references).
+    std::filesystem::path filename = saveFileDialog("Save Self-Contained glTF", kGltfFilter, getSceneDefaultFilename());
+    if(!filename.empty())
+      save(filename, /*selfContained=*/true);
   }
 
   if(saveScreenFile)
@@ -489,7 +1383,7 @@ void GltfRendererUI::renderMenu(GltfRenderer& renderer)
     std::filesystem::path filename = getSaveImage();
     if(!filename.empty())
     {
-      renderer.m_app->screenShot(filename, 100);
+      m_app->requestScreenShot(filename, 100);
     }
   }
 
@@ -498,29 +1392,709 @@ void GltfRendererUI::renderMenu(GltfRenderer& renderer)
     std::filesystem::path filename = getSaveImage();
     if(!filename.empty())
     {
-      renderer.m_app->saveImageToFile(renderer.m_resources.gBuffers.getColorImage(Resources::eImgTonemapped),
-                                      renderer.m_resources.gBuffers.getSize(), filename);
+      Resources::ImageType imageType =
+          (filename.extension() == ".hdr") ? Resources::ImageType::eImgRendered : Resources::ImageType::eImgTonemapped;
+
+      m_app->saveImageToFile(m_resources.gBuffers.getColorImage(imageType), m_resources.gBuffers.getSize(), filename);
     }
   }
 
-  if(validScene && (fitScene || (fitObject && renderer.m_resources.selectedObject > -1)))
+  if(validScene && (fitScene || (fitObject && !m_resources.selectedRenderNodes.empty())))
   {
-    nvutils::Bbox bbox = fitScene ? renderer.m_resources.scene.getSceneBounds() :
-                                    GltfRendererUI::getRenderNodeBbox(renderer, renderer.m_resources.selectedObject);
-    renderer.m_resources.cameraManip->fit(bbox.min(), bbox.max(), false, true, renderer.m_resources.cameraManip->getAspectRatio());
+    nvutils::Bbox bbox = fitScene ? m_resources.getScene()->getSceneBounds() :
+                                    GltfRenderer::getRenderNodesBbox(m_resources.selectedRenderNodes);
+    m_cameraManip->fit(bbox.min(), bbox.max(), false, true, m_cameraManip->getAspectRatio());
+  }
+
+  if(compactScene && validScene)
+  {
+    SCOPED_BANNER("Compact Scene");
+    if(m_resources.getScene()->compactModel())
+    {
+      // Compact rewires accessors — re-parse so render nodes / dirty flags match before GPU rebuild.
+      refreshCpuSceneGraphFromModel();
+      rebuildVulkanSceneFull();
+      resetFrame();  // Reset path tracer accumulation
+    }
   }
 
   if(closeApp)
   {
-    renderer.m_app->close();
+    m_app->close();
   }
 
-  if(renderer.m_app->isVsync() != v_sync)
+  if(m_app->isVsync() != v_sync)
   {
-    renderer.m_app->setVsync(v_sync);
+    m_app->setVsync(v_sync);
   }
 
   // Let both renderers handle their menus
-  renderer.m_pathTracer.onUIMenu();
-  renderer.m_rasterizer.onUIMenu();
+  m_pathTracer.onUIMenu();
+  m_rasterizer.onUIMenu();
+}
+
+// (renderAgenticWindow moved to agentic::renderAgenticWindow in src/ui_agentic.cpp.)
+
+
+void GltfRenderer::addToRecentFiles(const std::filesystem::path& filePath, int historySize)
+{
+  if(filePath.empty())
+    return;
+
+  auto it = std::find(m_recentFiles.begin(), m_recentFiles.end(), filePath);
+  if(it != m_recentFiles.end())
+  {
+    m_recentFiles.erase(it);
+  }
+  m_recentFiles.insert(m_recentFiles.begin(), filePath);
+  if(m_recentFiles.size() > historySize)
+  {
+    m_recentFiles.pop_back();
+  }
+}
+
+void GltfRenderer::removeFromRecentFiles(const std::filesystem::path& filePath)
+{
+  auto it = std::find(m_recentFiles.begin(), m_recentFiles.end(), filePath);
+  if(it != m_recentFiles.end())
+  {
+    m_recentFiles.erase(it);
+  }
+}
+
+// Register handler
+void GltfRenderer::registerRecentFilesHandler()
+{
+  // mandatory to work, see ImGui::DockContextInitialize as an example
+  auto readOpen = [](ImGuiContext*, ImGuiSettingsHandler*, const char* name) -> void* {
+    if(strcmp(name, "Data") != 0)
+      return nullptr;
+    return (void*)1;
+  };
+
+  // Save settings handler, not using capture so can be used as a function pointer
+  auto saveRecentFilesToIni = [](ImGuiContext* ctx, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf) {
+    auto* self = static_cast<GltfRenderer*>(handler->UserData);
+    buf->appendf("[%s][Data]\n", handler->TypeName);
+    for(const auto& file : self->m_recentFiles)
+    {
+      buf->appendf("File=%s\n", file.string().c_str());
+    }
+    // Save directory preferences
+    if(!self->m_lastSceneDirectory.empty())
+    {
+      buf->appendf("SceneDir=%s\n", self->m_lastSceneDirectory.string().c_str());
+    }
+    if(!self->m_lastHdrDirectory.empty())
+    {
+      buf->appendf("HdrDir=%s\n", self->m_lastHdrDirectory.string().c_str());
+    }
+    buf->append("\n");
+  };
+
+  // Load settings handler, not using capture so can be used as a function pointer
+  auto loadRecentFilesFromIni = [](ImGuiContext* ctx, ImGuiSettingsHandler* handler, void* entry, const char* line) {
+    auto* self = static_cast<GltfRenderer*>(handler->UserData);
+    if(strncmp(line, "File=", 5) == 0)
+    {
+      const char* filePath = line + 5;
+      auto        it       = std::find(self->m_recentFiles.begin(), self->m_recentFiles.end(), filePath);
+      if(it == self->m_recentFiles.end())
+      {
+        self->m_recentFiles.push_back(filePath);
+      }
+    }
+    else if(strncmp(line, "SceneDir=", 9) == 0)
+    {
+      const char* dirPath        = line + 9;
+      self->m_lastSceneDirectory = std::filesystem::path(dirPath);
+    }
+    else if(strncmp(line, "HdrDir=", 7) == 0)
+    {
+      const char* dirPath      = line + 7;
+      self->m_lastHdrDirectory = std::filesystem::path(dirPath);
+    }
+  };
+
+  //
+  ImGuiSettingsHandler iniHandler;
+  iniHandler.TypeName   = "RecentFiles";
+  iniHandler.TypeHash   = ImHashStr(iniHandler.TypeName);
+  iniHandler.ReadOpenFn = readOpen;
+  iniHandler.WriteAllFn = saveRecentFilesToIni;
+  iniHandler.ReadLineFn = loadRecentFilesFromIni;
+  iniHandler.UserData   = this;  // Pass the current instance to the handler
+  ImGui::GetCurrentContext()->SettingsHandlers.push_back(iniHandler);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Apply a GLTF camera to the camera manipulator
+// This function converts GLTF camera parameters to camera manipulator settings
+// and applies them to the current view
+//
+void GltfRenderer::applyGltfCamera(int cameraIndex)
+{
+  if(!m_resources.getScene() || !m_resources.getScene()->valid())
+    return;
+
+  // Get the node that contains this camera to clear its extras
+  int nodeIndex = m_sceneBrowser.getNodeForCamera(cameraIndex);
+  if(nodeIndex >= 0)
+  {
+    // Clear the camera extras so that eye/center/up are recalculated from the world matrix
+    tinygltf::Node& node = m_resources.getScene()->getModel().nodes[nodeIndex];
+    if(node.extras.IsObject())
+    {
+      tinygltf::Value::Object extras = node.extras.Get<tinygltf::Value::Object>();
+      extras.erase("camera::eye");
+      extras.erase("camera::center");
+      extras.erase("camera::up");
+      node.extras = tinygltf::Value(extras);
+    }
+  }
+
+  // Force refresh of render cameras to reflect latest UI changes
+  const std::vector<nvvkgltf::RenderCamera>& cameras = m_resources.getScene()->getRenderCameras(true);
+
+  if(cameraIndex < 0 || cameraIndex >= static_cast<int>(cameras.size()))
+    return;
+
+  const nvvkgltf::RenderCamera& camera = cameras[cameraIndex];
+
+  if(camera.type == nvvkgltf::RenderCamera::CameraType::ePerspective)
+  {
+    float                              fov = static_cast<float>(glm::degrees(camera.yfov));
+    nvutils::CameraManipulator::Camera cam{camera.eye, camera.center, camera.up, fov};
+    cam.projectionType = nvutils::CameraManipulator::Perspective;
+    m_cameraManip->setCamera(cam);
+    m_cameraManip->setClipPlanes({static_cast<float>(camera.znear), static_cast<float>(camera.zfar)});
+  }
+  else if(camera.type == nvvkgltf::RenderCamera::CameraType::eOrthographic)
+  {
+    float                              fov = 45.0f;
+    nvutils::CameraManipulator::Camera cam{camera.eye, camera.center, camera.up, fov};
+    cam.projectionType = nvutils::CameraManipulator::Orthographic;
+    cam.orthMag.x      = static_cast<float>(camera.xmag);
+    cam.orthMag.y      = static_cast<float>(camera.ymag);
+    m_cameraManip->setCamera(cam);
+    m_cameraManip->adjustOrthographicAspect();
+    m_cameraManip->setClipPlanes({static_cast<float>(camera.znear), static_cast<float>(camera.zfar)});
+  }
+
+  // Also update the scene's camera to keep extras (eye, center, up) in sync
+  m_resources.getScene()->setSceneCamera(camera);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Set a GLTF camera from the current camera manipulator state
+// This function updates the GLTF camera parameters and node extras with the current view
+//
+void GltfRenderer::setGltfCameraFromView(int cameraIndex)
+{
+  if(!m_resources.getScene() || !m_resources.getScene()->valid() || !m_cameraManip)
+  {
+    return;
+  }
+
+  // Get the node that contains this camera
+  int nodeIndex = m_sceneBrowser.getNodeForCamera(cameraIndex);
+  if(nodeIndex < 0)
+  {
+    return;
+  }
+
+  tinygltf::Node&   node   = m_resources.getScene()->getModel().nodes[nodeIndex];
+  tinygltf::Camera& camera = m_resources.getScene()->getModel().cameras[cameraIndex];
+
+  // Get current camera state from manipulator
+  nvutils::CameraManipulator::Camera cameraState = m_cameraManip->getCamera();
+  glm::vec2                          clipPlanes  = m_cameraManip->getClipPlanes();
+
+  // Update the camera parameters
+  if(cameraState.projectionType == nvutils::CameraManipulator::Orthographic)
+  {
+    camera.type                         = "orthographic";
+    tinygltf::OrthographicCamera& ortho = camera.orthographic;
+    ortho.xmag                          = static_cast<double>(cameraState.orthMag.x);
+    ortho.ymag                          = static_cast<double>(cameraState.orthMag.y);
+    ortho.znear                         = static_cast<double>(clipPlanes.x);
+    ortho.zfar                          = static_cast<double>(clipPlanes.y);
+  }
+  else
+  {
+    camera.type                        = "perspective";
+    tinygltf::PerspectiveCamera& persp = camera.perspective;
+    // Convert FOV from degrees (manipulator) to radians (GLTF)
+    persp.yfov  = glm::radians(cameraState.fov);
+    persp.znear = static_cast<double>(clipPlanes.x);
+    persp.zfar  = static_cast<double>(clipPlanes.y);
+    // Aspect ratio will be calculated from viewport when camera is applied
+  }
+
+  // Update the node transformation to match the current camera position
+  // The camera's eye position becomes the node's translation
+  node.translation = {cameraState.eye.x, cameraState.eye.y, cameraState.eye.z};
+
+  // Calculate the rotation that points the camera from eye to center with the given up vector
+  glm::dvec3 forward = glm::normalize(cameraState.ctr - cameraState.eye);
+  glm::dvec3 right   = glm::normalize(glm::cross(forward, cameraState.up));
+  glm::dvec3 up      = glm::normalize(glm::cross(right, forward));
+
+  // Create rotation matrix and convert to quaternion
+  glm::dmat3 rotationMatrix(right, up, -forward);  // -forward because GLTF cameras look down -Z
+  glm::dquat rotation = glm::quat_cast(rotationMatrix);
+
+  node.rotation = {rotation.x, rotation.y, rotation.z, rotation.w};
+  node.scale    = {1.0, 1.0, 1.0};
+
+  // Clear any existing matrix since we're using TRS
+  node.matrix.clear();
+
+  // Update the node extras with the current eye, center, and up vectors
+  if(!node.extras.IsObject())
+  {
+    node.extras = tinygltf::Value(tinygltf::Value::Object());
+  }
+
+  tinygltf::Value::Object extras = node.extras.Get<tinygltf::Value::Object>();
+
+  // Store eye vector
+  extras["camera::eye"]    = tinygltf::utils::convertToTinygltfValue(3, glm::value_ptr(cameraState.eye));
+  extras["camera::center"] = tinygltf::utils::convertToTinygltfValue(3, glm::value_ptr(cameraState.ctr));
+  extras["camera::up"]     = tinygltf::utils::convertToTinygltfValue(3, glm::value_ptr(cameraState.up));
+  node.extras              = tinygltf::Value(extras);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Display GPU memory statistics in an ImGui window
+//
+void GltfRenderer::renderMemoryStatistics()
+{
+  using namespace nvvkgltf;
+
+  if(!m_resources.settings.showMemStats)
+    return;
+
+  if(!ImGui::Begin("Memory Statistics", &m_resources.settings.showMemStats))
+  {
+    ImGui::End();
+    return;
+  }
+
+  // Helper function to format bytes
+  auto formatBytes = [](uint64_t bytes) -> std::string {
+    if(bytes >= 1024ULL * 1024ULL * 1024ULL)
+      return fmt::format("{:.2f} GB", bytes / (1024.0 * 1024.0 * 1024.0));
+    if(bytes >= 1024ULL * 1024ULL)
+      return fmt::format("{:.2f} MB", bytes / (1024.0 * 1024.0));
+    if(bytes >= 1024ULL)
+      return fmt::format("{:.2f} KB", bytes / 1024.0);
+    return fmt::format("{} B", bytes);
+  };
+
+  // Get memory trackers from subsystems
+  const auto& vkTracker        = m_resources.sceneVk.getMemoryTracker();
+  const auto& rtxTracker       = m_resources.sceneRtx.getMemoryTracker();
+  const auto& transformTracker = m_resources.transformCompute.getMemoryTracker();
+  const auto& animationTracker = m_resources.animationVk.getMemoryTracker();
+  const auto& appTracker       = m_resources.appMemoryTracker;
+
+  // Create sortable table with memory statistics
+  ImGuiTableFlags tableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Sortable;
+  if(ImGui::BeginTable("MemoryStatsTable", 3, tableFlags))
+  {
+    // Setup sortable columns
+    ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthFixed, 120.0f);
+    ImGui::TableSetupColumn("Current", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+    ImGui::TableSetupColumn("Count", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+    ImGui::TableHeadersRow();
+
+    // Get sort specifications
+    const ImGuiTableColumnSortSpecs& spec      = ImGui::TableGetSortSpecs()->Specs[0];
+    const CategorySortBy             sortBy    = CategorySortBy(spec.ColumnIndex);
+    const bool                       ascending = (spec.SortDirection == ImGuiSortDirection_Ascending);
+
+    // --- Scene (SceneVk) Section ---
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "SCENE");
+    ImGui::TableNextColumn();
+    ImGui::TableNextColumn();
+
+    // Display SceneVk categories with sorting
+    for(const auto& categoryName : vkTracker.getActiveCategories(sortBy, ascending))
+    {
+      GpuMemoryStats stats = vkTracker.getStats(categoryName);
+
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::Text("  %s", categoryName.c_str());
+      ImGui::TableNextColumn();
+      ImGui::Text("%s", formatBytes(stats.currentBytes).c_str());
+      ImGui::TableNextColumn();
+      ImGui::Text("%u", stats.currentCount);
+    }
+
+    // Scene subtotal
+    auto totalVk = vkTracker.getTotalStats();
+    if(totalVk.currentBytes > 0)
+    {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "  Scene Subtotal");
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "%s", formatBytes(totalVk.currentBytes).c_str());
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "%u", totalVk.currentCount);
+    }
+
+    // --- RTX (SceneRtx) Section ---
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "RTX (Acceleration)");
+    ImGui::TableNextColumn();
+    ImGui::TableNextColumn();
+
+    // Display SceneRtx categories with sorting
+    for(const auto& categoryName : rtxTracker.getActiveCategories(sortBy, ascending))
+    {
+      GpuMemoryStats stats = rtxTracker.getStats(categoryName);
+
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::Text("  %s", categoryName.c_str());
+      ImGui::TableNextColumn();
+      ImGui::Text("%s", formatBytes(stats.currentBytes).c_str());
+      ImGui::TableNextColumn();
+      ImGui::Text("%u", stats.currentCount);
+    }
+
+    // RTX subtotal
+    auto totalRtx = rtxTracker.getTotalStats();
+    if(totalRtx.currentBytes > 0)
+    {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.7f, 1.0f), "  RTX Subtotal");
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.7f, 1.0f), "%s", formatBytes(totalRtx.currentBytes).c_str());
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.7f, 1.0f), "%u", totalRtx.currentCount);
+    }
+
+    // --- Transform (GPU compute) Section ---
+    auto totalTransform = transformTracker.getTotalStats();
+    if(totalTransform.currentBytes > 0)
+    {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "TRANSFORM (GPU)");
+      ImGui::TableNextColumn();
+      ImGui::TableNextColumn();
+
+      for(const auto& categoryName : transformTracker.getActiveCategories(sortBy, ascending))
+      {
+        GpuMemoryStats stats = transformTracker.getStats(categoryName);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("  %s", categoryName.c_str());
+        ImGui::TableNextColumn();
+        ImGui::Text("%s", formatBytes(stats.currentBytes).c_str());
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", stats.currentCount);
+      }
+
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.7f, 1.0f, 0.7f, 1.0f), "  Transform Subtotal");
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.7f, 1.0f, 0.7f, 1.0f), "%s", formatBytes(totalTransform.currentBytes).c_str());
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.7f, 1.0f, 0.7f, 1.0f), "%u", totalTransform.currentCount);
+    }
+
+    // --- Animation (GPU compute) Section ---
+    auto totalAnimation = animationTracker.getTotalStats();
+    if(totalAnimation.currentBytes > 0)
+    {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "ANIMATION (GPU)");
+      ImGui::TableNextColumn();
+      ImGui::TableNextColumn();
+
+      for(const auto& categoryName : animationTracker.getActiveCategories(sortBy, ascending))
+      {
+        GpuMemoryStats stats = animationTracker.getStats(categoryName);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("  %s", categoryName.c_str());
+        ImGui::TableNextColumn();
+        ImGui::Text("%s", formatBytes(stats.currentBytes).c_str());
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", stats.currentCount);
+      }
+
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.6f, 1.0f), "  Animation Subtotal");
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.6f, 1.0f), "%s", formatBytes(totalAnimation.currentBytes).c_str());
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.6f, 1.0f), "%u", totalAnimation.currentCount);
+    }
+
+    // --- Application (frame targets, denoisers) Section ---
+    auto totalApp = appTracker.getTotalStats();
+    // OptiX export memory is only compiled in when USE_OPTIX_DENOISER is enabled (see CMakeLists.txt).
+    GpuMemoryStats totalOptixExport{};
+#if defined(USE_OPTIX_DENOISER)
+    if(const OptiXDenoiser* optix = m_pathTracer.getOptiXDenoiser())
+      totalOptixExport = optix->getExportMemoryTracker().getTotalStats();
+#endif
+
+    uint64_t appCombinedBytes = totalApp.currentBytes + totalOptixExport.currentBytes;
+    uint32_t appCombinedCount = totalApp.currentCount + totalOptixExport.currentCount;
+    if(appCombinedBytes > 0)
+    {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.8f, 0.6f, 1.0f, 1.0f), "APPLICATION");
+      ImGui::TableNextColumn();
+      ImGui::TableNextColumn();
+
+      for(const auto& categoryName : appTracker.getActiveCategories(sortBy, ascending))
+      {
+        GpuMemoryStats stats = appTracker.getStats(categoryName);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("  %s", categoryName.c_str());
+        ImGui::TableNextColumn();
+        ImGui::Text("%s", formatBytes(stats.currentBytes).c_str());
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", stats.currentCount);
+      }
+
+#if defined(USE_OPTIX_DENOISER)
+      if(const OptiXDenoiser* optix = m_pathTracer.getOptiXDenoiser())
+      {
+        for(const auto& categoryName : optix->getExportMemoryTracker().getActiveCategories(sortBy, ascending))
+        {
+          GpuMemoryStats stats = optix->getExportMemoryTracker().getStats(categoryName);
+          ImGui::TableNextRow();
+          ImGui::TableNextColumn();
+          ImGui::Text("  %s", categoryName.c_str());
+          ImGui::TableNextColumn();
+          ImGui::Text("%s", formatBytes(stats.currentBytes).c_str());
+          ImGui::TableNextColumn();
+          ImGui::Text("%u", stats.currentCount);
+        }
+      }
+#endif
+
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.9f, 0.8f, 1.0f, 1.0f), "  Application Subtotal");
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.9f, 0.8f, 1.0f, 1.0f), "%s", formatBytes(appCombinedBytes).c_str());
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImVec4(0.9f, 0.8f, 1.0f, 1.0f), "%u", appCombinedCount);
+    }
+
+    // --- Combined Total ---
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "TOTAL");
+    ImGui::TableNextColumn();
+    auto combinedBytes = totalVk.currentBytes + totalRtx.currentBytes + totalTransform.currentBytes
+                         + totalAnimation.currentBytes + appCombinedBytes;
+    auto combinedCount = totalVk.currentCount + totalRtx.currentCount + totalTransform.currentCount
+                         + totalAnimation.currentCount + appCombinedCount;
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%s", formatBytes(combinedBytes).c_str());
+    ImGui::TableNextColumn();
+    ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "%u", combinedCount);
+
+    ImGui::EndTable();
+  }
+
+  ImGui::End();
+}
+
+//--------------------------------------------------------------------------------------------------
+// Environment window - controls for environment settings (HDR, Sky, Solid Color)
+//
+void GltfRenderer::renderEnvironmentWindow()
+{
+  if(!m_resources.settings.showEnvironmentWindow)
+    return;
+
+  if(!ImGui::Begin("Environment", &m_resources.settings.showEnvironmentWindow))
+  {
+    ImGui::End();
+    return;
+  }
+  nvgui::tooltip("Press F5 to toggle this window");
+  bool changed = false;
+  namespace PE = nvgui::PropertyEditor;
+
+  if(PE::begin())
+  {
+    if(PE::Combo("Environment Type", (int*)&m_resources.settings.envSystem, "Sky\0HDR\0None\0\0"))  // 0: Sky, 1: HDR, 2: None
+    {
+      m_pathTracer.m_pushConst.fireflyClampThreshold =
+          (m_resources.settings.envSystem == shaderio::EnvSystem::eHdr) ? m_resources.hdrIbl.getIntegral() : 10.0f;
+      changed |= true;
+    }
+    changed |= PE::Checkbox("Solid Color", &m_resources.settings.useSolidBackground);
+    if(m_resources.settings.useSolidBackground)
+    {
+      changed |= uicolor::colorEdit3Linear("Background Color", glm::value_ptr(m_resources.settings.solidBackgroundColor),
+                                           "Solid background color (shown/edited in linear; swatch/wheel perceptual).");
+    }
+    PE::end();
+  }
+
+  if(m_resources.settings.envSystem == shaderio::EnvSystem::eHdr)
+  {
+    if(PE::begin("HDR"))
+    {
+      if(PE::entry("", [&] { return ImGui::SmallButton("load"); }, "Load HDR Image"))
+      {
+        loadHdrFileDialog();
+        changed = true;
+      }
+      changed |= PE::SliderFloat("Intensity", &m_resources.settings.hdrEnvIntensity, 0, 100, "%.3f",
+                                 ImGuiSliderFlags_Logarithmic, "HDR intensity");
+      changed |= PE::SliderAngle("Rotation", &m_resources.settings.hdrEnvRotation, -360, 360, "%.0f deg", 0, "Rotating the environment");
+      changed |= PE::SliderFloat("Blur", &m_resources.settings.hdrBlur, 0, 1, "%.3f", 0, "Blur the environment");
+      PE::end();
+    }
+  }
+  else if(m_resources.settings.envSystem == shaderio::EnvSystem::eSky)
+  {
+    changed |= nvgui::skyPhysicalParameterUI(m_resources.skyParams);
+  }
+
+  if(changed)
+    resetFrame();
+
+  ImGui::End();
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tonemapper window - controls for tone mapping settings
+//
+void GltfRenderer::renderTonemapperWindow()
+{
+  if(!m_resources.settings.showTonemapperWindow)
+    return;
+
+  if(!ImGui::Begin("Tonemapper", &m_resources.settings.showTonemapperWindow))
+  {
+    ImGui::End();
+    return;
+  }
+  nvgui::tooltip("Press F6 to toggle this window");
+  nvgui::tonemapperWidget(m_resources.tonemapperData);
+
+  ImGui::End();
+}
+
+//--------------------------------------------------------------------------------------------------
+// Statistics window - displays scene statistics
+//
+void GltfRenderer::renderStatisticsWindow()
+{
+  if(!m_resources.settings.showStatisticsWindow)
+    return;
+
+  if(!ImGui::Begin("Statistics", &m_resources.settings.showStatisticsWindow))
+  {
+    ImGui::End();
+    return;
+  }
+
+  if(!m_resources.getScene() || !m_resources.getScene()->valid())
+  {
+    ImGui::TextDisabled("No scene loaded");
+    ImGui::End();
+    return;
+  }
+
+  const tinygltf::Model& tiny = m_resources.getScene()->getModel();
+
+  // Create a table for better organization
+  if(ImGui::BeginTable("StatisticsTable", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+  {
+    ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+    ImGui::TableHeadersRow();
+
+    // Lambda function to add table rows
+    auto addStatRow = [](const char* icon, const char* label, size_t value) {
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::Text("%s %s", icon, label);
+      ImGui::TableSetColumnIndex(1);
+      ImGui::Text("%zu", value);
+    };
+
+    // Scene Structure
+    addStatRow(ICON_MS_LAYERS, "Nodes", tiny.nodes.size());
+    addStatRow(ICON_MS_VIEW_LIST, "Render Nodes", m_resources.getScene()->getRenderNodes().size());
+    addStatRow(ICON_MS_EXTENSION, "Render Primitives", m_resources.getScene()->getNumRenderPrimitives());
+
+    // Materials & Geometry
+    addStatRow(ICON_MS_BRUSH, "Materials", tiny.materials.size());
+    addStatRow(ICON_MS_SIGNAL_CELLULAR_NULL, "Triangles", m_resources.getScene()->getNumTriangles());
+
+    // Lighting & Assets
+    addStatRow(ICON_MS_LIGHTBULB, "Lights", tiny.lights.size());
+    addStatRow(ICON_MS_IMAGE_INSET, "Textures", tiny.textures.size());
+    addStatRow(ICON_MS_IMAGE, "Images", tiny.images.size());
+
+    ImGui::EndTable();
+  }
+
+  // Copy to clipboard button with proper spacing
+  ImGui::Spacing();
+
+  if(ImGui::Button(ICON_MS_CONTENT_COPY " Copy to Clipboard"))
+  {
+    ImGui::LogToClipboard();
+    // Log all statistics to clipboard
+    ImGui::LogText("Scene Statistics:\n");
+    ImGui::LogText("Nodes: %zu\n", tiny.nodes.size());
+    ImGui::LogText("Render Nodes: %zu\n", m_resources.getScene()->getRenderNodes().size());
+    ImGui::LogText("Render Primitives: %zu\n", m_resources.getScene()->getNumRenderPrimitives());
+    ImGui::LogText("Materials: %zu\n", tiny.materials.size());
+    ImGui::LogText("Triangles: %d\n", m_resources.getScene()->getNumTriangles());
+    ImGui::LogText("Lights: %zu\n", tiny.lights.size());
+    ImGui::LogText("Textures: %zu\n", tiny.textures.size());
+    ImGui::LogText("Images: %zu\n", tiny.images.size());
+    ImGui::LogFinish();
+  }
+  if(ImGui::IsItemHovered())
+  {
+    ImGui::SetTooltip("Copy statistics to clipboard");
+  }
+
+  // Compact Scene button
+  ImGui::SameLine();
+  if(ImGui::Button(ICON_MS_COMPRESS " Compact Scene"))
+  {
+    SCOPED_BANNER("Compact Scene");
+    if(m_resources.getScene()->compactModel())
+    {
+      refreshCpuSceneGraphFromModel();
+      rebuildVulkanSceneFull();
+      resetFrame();  // Reset path tracer accumulation
+    }
+  }
+  if(ImGui::IsItemHovered())
+  {
+    ImGui::SetTooltip("Remove orphaned resources - see counts update immediately");
+  }
+
+  ImGui::End();
 }

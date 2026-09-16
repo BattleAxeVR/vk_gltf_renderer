@@ -1,8 +1,28 @@
+/*
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
 #ifndef DLSS_UTIL_H
 #define DLSS_UTIL_H
 
 #include "nvshaders/slang_types.h"
+
+NAMESPACE_SHADERIO_BEGIN()
 
 #ifdef __cplusplus
 #define INLINE inline
@@ -40,31 +60,39 @@ float3 EnvBRDFApprox2(float3 SpecularColor, float alpha, float NoV)
   return mad(SpecularColor, max(0, scale), max(0, bias));
 }
 
-// Function to calculate 2D motion vectors for DLSS denoising
-inline float2 calculateMotionVector(float3   worldPos,    // Current world-space hit position
-                                    float4x4 prevMVP,     // Previous frame's Model-View-Projection matrix
-                                    float4x4 currentMVP,  // Current frame's Model-View-Projection matrix
-                                    float2   resolution)    // Render target resolution
+// Pixel-space motion vector for DLSS / DLAA. The two overloads share one piece of math:
+// `MV = (prev_NDC - curr_NDC) * 0.5 * resolution` (equivalent to `(prev_UV - curr_UV) * resolution`).
+// NGX expects pixel-space MVs when InMVScaleX/Y = 1.0, which is what both renderers configure.
+//
+// Overload 1 (raster vertex shader): the vertex shader has already transformed the world position
+// through the unjittered viewProj / prevMVP, so the fragment shader just consumes the two clip
+// positions interpolated by the rasterizer.
+inline float2 calculateMotionVector(float4 currClip, float4 prevClip, float2 resolution)
 {
-  // Transform current world position to clip space for current frame
-  float4 currentClipPos = mul(float4(worldPos, 1.0f), currentMVP);
-  currentClipPos /= currentClipPos.w;
+  float2 currNDC = currClip.xy / currClip.w;
+  float2 prevNDC = prevClip.xy / prevClip.w;
+  return (prevNDC - currNDC) * 0.5f * resolution;
+}
 
-  // Transform current world position to clip space for previous frame
-  float4 prevClipPos = mul(float4(worldPos, 1.0f), prevMVP);
-  prevClipPos /= prevClipPos.w;
-
-  // Convert clip space coordinates to screen space (0 to 1 range)
-  float2 currentScreenPos = float2(currentClipPos.xy) * 0.5f + 0.5f;
-  float2 prevScreenPos    = float2(prevClipPos.xy) * 0.5f + 0.5f;
-
-  // Calculate motion vector in screen space
-  float2 motionVector = prevScreenPos - currentScreenPos;
-
-  // Scale motion vector to pixel space
-  motionVector *= resolution;
-
-  return motionVector;
+// Overload 2 (path tracer): homogeneous current/previous positions reprojected through the two
+// cameras. The w component selects the behavior, which is the elegant part:
+//   - Surface hits pass w = 1. The previous position is the same surface point under the previous
+//     object transform, so the single screen-space difference is the combined camera + object motion
+//     (correct under perspective, NOT an additive sum of two MVs). A static surface passes
+//     prevWorldPos == currWorldPos and reduces to camera-only motion.
+//   - Sky / background pass w = 0: a point at infinity along the (world-space) view direction. Camera
+//     translation then cancels out of the projection (only rotation moves the sky), which is the
+//     physically correct behavior and is fully projection-independent -- no far-plane distance or
+//     magic constants. (Approach from the vk_denoise_dlssrr sample.)
+inline float2 calculateMotionVector(float4   currWorldPos,  // Current homogeneous position (w=1 surface, w=0 sky)
+                                    float4   prevWorldPos,  // Previous homogeneous position of the same point
+                                    float4x4 prevMVP,       // Previous frame's view-projection matrix
+                                    float4x4 currentMVP,    // Current frame's view-projection matrix
+                                    float2   resolution)      // Render target resolution
+{
+  float4 currentClipPos = mul(currWorldPos, currentMVP);
+  float4 prevClipPos    = mul(prevWorldPos, prevMVP);
+  return calculateMotionVector(currentClipPos, prevClipPos, resolution);
 }
 #endif
 
@@ -107,10 +135,10 @@ INLINE float2 sampleDelta(uint32_t frameIndex)
 
 INLINE float2 dlssJitter(uint32_t frameIndex)
 {
-    //return sampleDelta(frameIndex);
-    return halton(frameIndex) - float2(0.5,0.5);
+  //return sampleDelta(frameIndex);
+  return halton(frameIndex) - float2(0.5, 0.5);
 }
 
-
+NAMESPACE_SHADERIO_END()
 
 #endif  // DLSS_UTIL_H

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,35 +13,54 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// This shader applies a Sobel filter to detect edges in an R8 image and
-// highlights them in the output RGBA image.
+// This shader applies a Sobel filter to detect edges using an ObjectID image
+// and a selection bitmask, then highlights them in the output RGBA image.
 
 #include "shaderio.h"
 
 struct PushConstantSilhouette
 {
   float3 color;
+  uint   selectionBitMaskWordCount;
 };
 
 // clang-format off
-[[vk::binding(SilhouetteBindings::eObjectID)]]      Texture2D<float>    u_R8Buffer;
-[[vk::binding(SilhouetteBindings::eRGBAIImage)]]    RWTexture2D<float4> u_RgbaImage;
+[[vk::binding(SilhouetteBindings::eObjectID)]]         Texture2D<float>      u_ObjectID;  // .r = objectID+1 (0 = no hit)
+[[vk::binding(SilhouetteBindings::eRGBAIImage)]]       RWTexture2D<float4>   u_RgbaImage;
+[[vk::binding(SilhouetteBindings::eSelectionBitMask)]] StructuredBuffer<uint> u_SelectionBitMask;
 
 [[vk::push_constant]]   ConstantBuffer<PushConstantSilhouette> pushConst;
 // clang-format on
+
+// Returns true if objectIDPlusOne (from the ObjectID image) is selected (bit set in mask)
+bool isSelected(uint objectIDPlusOne)
+{
+  if(objectIDPlusOne == 0u)
+    return false;  // No hit
+  uint objectID = objectIDPlusOne - 1u;
+  uint wordIdx  = objectID / 32u;
+  if(wordIdx >= pushConst.selectionBitMaskWordCount)
+    return false;
+  uint bitIdx = objectID % 32u;
+  return ((u_SelectionBitMask[wordIdx] >> bitIdx) & 1u) != 0u;
+}
 
 [shader("compute")]
 [numthreads(SILHOUETTE_WORKGROUP_SIZE, SILHOUETTE_WORKGROUP_SIZE, 1)]
 void main(uint3 dispatchThreadID: SV_DispatchThreadID)
 {
-  uint2 texSize;
+  int2 texSize;
   u_RgbaImage.GetDimensions(texSize.x, texSize.y);  // DispatchRaysDimensions();
 
-  const uint2 pixelCoord = uint2(dispatchThreadID.xy);
+  const int2 pixelCoord = int2(dispatchThreadID.xy);
+
+  // Early exit if pixel is outside image bounds
+  if(pixelCoord.x >= texSize.x || pixelCoord.y >= texSize.y)
+    return;
 
   // Define the Sobel kernel in the x and y directions
   const float kernelX[9] = float[](-1, 0, 1, -2, 0, 2, -1, 0, 1);
@@ -50,20 +69,23 @@ void main(uint3 dispatchThreadID: SV_DispatchThreadID)
   float sumX = 0.0;
   float sumY = 0.0;
 
-  // Check boundaries
-  if(pixelCoord.x > 0 && pixelCoord.x < texSize.x - 1 && pixelCoord.y > 0 && pixelCoord.y < texSize.y - 1)
+  // Apply Sobel filter with proper boundary handling
+  [unroll]
+  for(int i = -1; i <= 1; i++)
   {
     [unroll]
-    for(int i = -1; i <= 1; i++)
+    for(int j = -1; j <= 1; j++)
     {
-      [unroll]
-      for(int j = -1; j <= 1; j++)
-      {
-        const uint2 offset = uint2(i, j);
-        const float val    = u_R8Buffer[pixelCoord + offset].r;
-        sumX += val * kernelX[(i + 1) * 3 + (j + 1)];
-        sumY += val * kernelY[(i + 1) * 3 + (j + 1)];
-      }
+      const int2 offset      = int2(i, j);
+      const int2 sampleCoord = pixelCoord + offset;
+
+      // Clamp coordinates to image bounds
+      const int2 clampedCoord = int2(clamp(sampleCoord.x, 0, texSize.x - 1), clamp(sampleCoord.y, 0, texSize.y - 1));
+
+      const float rawIDFloat = u_ObjectID[clampedCoord].r;
+      const float val        = isSelected(asuint(rawIDFloat)) ? 1.0 : 0.0;
+      sumX += val * kernelX[(i + 1) * 3 + (j + 1)];
+      sumY += val * kernelY[(i + 1) * 3 + (j + 1)];
     }
   }
 

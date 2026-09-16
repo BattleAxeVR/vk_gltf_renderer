@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,9 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+//
+// Abstract base class for renderers (path tracer, rasterizer, etc.).
+// Defines the virtual interface for attach/detach, resize, render,
+// shader compilation, and pipeline creation that each concrete
+// renderer implementation must provide.
+//
 
 #pragma once
 #include <nvapp/application.hpp>
@@ -29,16 +36,26 @@ public:
   BaseRenderer()          = default;
   virtual ~BaseRenderer() = default;
 
-
   virtual void onAttach(Resources& resources, nvvk::ProfilerGpuTimer* profiler) { m_profiler = profiler; }
   virtual void onDetach(Resources& resources) {};
   virtual void onResize(VkCommandBuffer cmd, const VkExtent2D& size, Resources& resources) {};
-  virtual bool onUIRender(Resources&) { return false; }
   virtual void onRender(VkCommandBuffer cmd, Resources& resources) {};
   virtual void onUIMenu() {};
+  virtual void onSceneInvalidated(Resources& resources) {};
+
+  // A scene edit changed appearance in a way motion vectors can't describe (material/light
+  // property write - e.g. a KHR_interactivity pointer/set on a texture-transform offset, or an
+  // Inspector material edit). Unlike onSceneInvalidated() (whole-scene swap: frees GPU resources,
+  // drops sort/record state), this is a lightweight per-edit DLSS temporal-history discard only -
+  // see docs/denoising.md.
+  virtual void notifyDlssContentReset(Resources& resources) {};
+
+  [[nodiscard]] virtual bool onUIRender(Resources&) { return false; }
+
   //---
   virtual void compileShader(Resources& resources, bool fromFile = true) {};
   virtual void createPipeline(Resources& resources) {};
+  virtual void freeRecordCommandBuffer(Resources& resources) {};
 
 protected:
   nvvk::ProfilerGpuTimer* m_profiler{nullptr};
