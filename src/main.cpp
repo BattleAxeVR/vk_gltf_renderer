@@ -43,6 +43,8 @@
 #include <nvvk/validation_settings.hpp>
 
 #include "renderer.hpp"
+#include "ui_dock_layout.hpp"
+#include "mcp_timing.hpp"
 #ifdef USE_AGENTIC
 #include "agentic_bridge.hpp"
 #endif
@@ -102,9 +104,37 @@ auto main(int argc, char** argv) -> int
   // Application defaults overrides
   appInfo.preferredVsyncOffMode = VK_PRESENT_MODE_MAILBOX_KHR;
 
-  // Command line parameters registration
-  parameterRegistry.add({"scenefile", "Input scene filename"}, {".gltf"}, &sceneFilename);
-  parameterRegistry.add({"hdrfile", "Input HDR filename"}, {".hdr"}, &hdrFilename);
+  // Command line parameters registration.
+  //
+  // scenefile/hdrfile load on change, so they work identically from the command line, a benchmark
+  // sequence, and nvpro_set_parameters. `renderer` stays null until after the start-up parse, so
+  // the callbacks no-op there (the renderer has no Vulkan device yet, and a load attempt would
+  // only report the start-up file as broken); the explicit load further down handles that case.
+  GltfRenderer* renderer = nullptr;  // assigned after the start-up parse, below
+  parameterRegistry.add({.name = "scenefile",
+                         .help = "Input scene filename (loads immediately when set at runtime)",
+                         .callbackSuccess =
+                             [&renderer, &sceneFilename](const nvutils::ParameterBase* const) {
+                               // Warn if scene load fails so caller knows old scene is still active.
+                               if(renderer && !renderer->loadSceneFile(sceneFilename))
+                               {
+                                 LOGW("scenefile '%s' did not load; previous scene (if any) is still active.\n",
+                                      nvutils::utf8FromPath(sceneFilename).c_str());
+                               }
+                             }},
+                        {".gltf"}, &sceneFilename);
+  parameterRegistry.add({.name = "hdrfile",
+                         .help = "Input HDR filename (loads immediately when set at runtime)",
+                         .callbackSuccess =
+                             [&renderer, &hdrFilename](const nvutils::ParameterBase* const) {
+                               // Warn if HDR load fails so caller knows old HDR is still active.
+                               if(renderer && !renderer->loadHdrEnvironment(hdrFilename))
+                               {
+                                 LOGW("hdrfile '%s' did not load; previous HDR (if any) is still active.\n",
+                                      nvutils::utf8FromPath(hdrFilename).c_str());
+                               }
+                             }},
+                        {".hdr"}, &hdrFilename);
 #ifdef USE_AGENTIC
   parameterRegistry.add({"agenticBridgeRoot", "Root directory for the optional external generation bridge"}, &agenticBridgeRoot);
   parameterRegistry.add({"agenticBridgeInit", "Create the external generation bridge manifest/directories and exit"},
@@ -114,6 +144,12 @@ auto main(int argc, char** argv) -> int
   parameterRegistry.add({"headless"}, &appInfo.headless, true);
   parameterRegistry.add({"frames", "Number of frames to run in headless mode"}, &appInfo.headlessFrameCount);
   parameterRegistry.add({"vsync"}, &appInfo.vSync);
+#ifdef USE_NVMCP
+  bool     enableMcp = false;
+  uint32_t mcpPort   = 7671;
+  parameterRegistry.add({"mcp", "Serve the shader-timing tools over MCP (see src/mcp_timing.cpp)"}, &enableMcp, true);
+  parameterRegistry.add({"mcpPort", "Port for the --mcp endpoint (1-65535)"}, &mcpPort);
+#endif
   parameterRegistry.add({"benchmark", "Enable benchmarking: scripted sequences, no vsync, minimal UI"},
                         &benchmarkOptions.enabled);
   parameterRegistry.add({"vvl", "Activate Vulkan Validation Layer"}, &vkSetup.enableValidationLayers);
@@ -140,6 +176,10 @@ auto main(int argc, char** argv) -> int
   // Adding the parameter registry to the command line parser and parsing arguments
   cli.add(parameterRegistry);
   cli.parse(argc, argv);
+  // Only now may the scenefile/hdrfile callbacks act: during the parse above the renderer has no
+  // device yet, so a load would fail and report the start-up file as broken. The explicit load
+  // further down is what handles the command-line case.
+  renderer = elemGltfRenderer.get();
   cli.setVerbose(benchmarkOptions.enabled);
 
 #ifdef USE_AGENTIC
@@ -218,7 +258,7 @@ auto main(int argc, char** argv) -> int
   VkPhysicalDeviceRayQueryFeaturesKHR rayqueryFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
   VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
   VkPhysicalDeviceShaderObjectFeaturesEXT shaderObjectFeatures{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT};
-  VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV reorderFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV};
+  VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT reorderFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT};
   VkPhysicalDeviceOpacityMicromapFeaturesEXT ommFeature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT};
   // clang-format on
 
@@ -234,7 +274,7 @@ auto main(int argc, char** argv) -> int
       {VK_EXT_SHADER_OBJECT_EXTENSION_NAME, &shaderObjectFeatures},
       {VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, &baryFeatures},
       {VK_EXT_NESTED_COMMAND_BUFFER_EXTENSION_NAME, &nestedCmdFeature},
-      {VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, &reorderFeature, false},
+      {VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, &reorderFeature, false},
       {VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME, &ommFeature, false},  // Optional: Opacity Micromap (OMM)
   };
 
@@ -401,35 +441,9 @@ auto main(int argc, char** argv) -> int
   // it to leave ample headroom above the viewport/denoiser images the app already registers.
   appInfo.texturePoolSize = 1024U;
 
-  // Setting up the layout of the application
-  appInfo.dockSetup = [](ImGuiID viewportID) {
-    // Left side panel container
-    ImGuiID settingID = ImGui::DockBuilderSplitNode(viewportID, ImGuiDir_Left, 0.25F, nullptr, &viewportID);
-    ImGui::DockBuilderDockWindow("Camera", settingID);
-    ImGui::DockBuilderDockWindow("Settings", settingID);
-
-    // Under Setting
-    ImGuiID tonemapID = ImGui::DockBuilderSplitNode(settingID, ImGuiDir_Down, 0.35F, nullptr, &settingID);
-    ImGui::DockBuilderDockWindow("Tonemapper", tonemapID);
-    ImGui::DockBuilderDockWindow("Environment", tonemapID);
-
-    // Right side: Scene Browser, Inspector (bottom)
-    ImGuiID sceneBrowserID = ImGui::DockBuilderSplitNode(viewportID, ImGuiDir_Right, 0.25F, nullptr, &viewportID);
-    ImGui::DockBuilderDockWindow("Scene Browser", sceneBrowserID);
-    ImGuiID inspectorID = ImGui::DockBuilderSplitNode(sceneBrowserID, ImGuiDir_Down, 0.35F, nullptr, &sceneBrowserID);
-    ImGui::DockBuilderDockWindow("Inspector", inspectorID);
-
-    // bottom panel container
-    ImGuiID logID = ImGui::DockBuilderSplitNode(viewportID, ImGuiDir_Down, 0.35F, nullptr, &viewportID);
-    ImGui::DockBuilderDockWindow("Log", logID);
-    ImGuiID monitorID = ImGui::DockBuilderSplitNode(logID, ImGuiDir_Right, 0.35F, nullptr, &logID);
-    ImGui::DockBuilderDockWindow("NVML Monitor", monitorID);
-    ImGuiID profilerID = ImGui::DockBuilderSplitNode(logID, ImGuiDir_Right, 0.33F, nullptr, &logID);
-    ImGui::DockBuilderDockWindow("Profiler", profilerID);
-    ImGuiID memStatsID = ImGui::DockBuilderSplitNode(logID, ImGuiDir_Right, 0.33F, nullptr, &logID);
-    ImGui::DockBuilderDockWindow("Memory Statistics", memStatsID);
-    ImGui::DockBuilderDockWindow("Statistics", memStatsID);
-  };
+  // Setting up the layout of the application. The same function backs Windows > Reset UI Layout,
+  // so the two can never drift (src/ui_dock_layout.cpp).
+  appInfo.dockSetup = &ui::buildDefaultDockLayout;
 
   // Create the application
   nvapp::Application app;
@@ -448,6 +462,21 @@ auto main(int argc, char** argv) -> int
     app.addElement(elemSequencer);
   }
   app.addElement(elemGltfRenderer);
+#ifdef USE_NVMCP
+  if(enableMcp && (mcpPort == 0 || mcpPort > 65535))
+  {
+    // Narrowing a bad value would silently bind a different port than the client was told to use.
+    LOGE("--mcpPort %u is not a valid TCP port (1-65535); the MCP endpoint is disabled.\n", unsigned(mcpPort));
+    enableMcp = false;
+  }
+  if(enableMcp)
+  {
+    if(auto elemMcp = createTimingMcpServer({.port = uint16_t(mcpPort)}, elemGltfRenderer))
+    {
+      app.addElement(elemMcp);
+    }
+  }
+#endif
   if(!benchmarkOptions.enabled)
   {
     app.addElement(elemLogger);

@@ -51,6 +51,7 @@
 #include "scoped_banner.hpp"
 #include "tinygltf_utils.hpp"
 #include "ui_animation.hpp"
+#include "ui_dock_layout.hpp"
 #include "ui_interactivity.hpp"
 #include "ui_linear_color.hpp"
 #include "ui_mouse_state.hpp"
@@ -642,9 +643,11 @@ void GltfRenderer::renderUI()
     // Camera smooth animation runs always
     m_cameraManip->updateAnim();
 
-    // Camera orbit/pan/zoom only when gizmo is not capturing input
+    // Camera orbit/pan/zoom only when gizmo is not capturing input and no Ctrl modifier is
+    // held (Ctrl+key combos are application shortcuts like Ctrl+S / Ctrl+D, not camera controls).
     bool gizmoCapturedInput = m_visualHelpers.transform.isDragging();
-    if(!gizmoCapturedInput)
+    bool ctrlHeld           = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+    if(!gizmoCapturedInput && !ctrlHeld)
     {
       nvapp::ElementCamera::updateCamera(m_cameraManip, ImGui::GetCurrentWindow());
     }
@@ -831,6 +834,31 @@ void GltfRenderer::renderUI()
     }
     ImGui::EndPopup();
   }
+
+  // Windows > Reset All to Default: not undoable, so confirm before discarding the user's tuning.
+  if(m_openResetAllPopupNextFrame)
+  {
+    ImGui::OpenPopup("ResetAllConfirmation");
+    m_openResetAllPopupNextFrame = false;
+  }
+  if(ImGui::BeginPopupModal("ResetAllConfirmation", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+  {
+    ImGui::Text("Reset every setting to its default value and restore the default panel layout?");
+    ImGui::Text("The loaded scene and environment image stay loaded, but the settings that drive them");
+    ImGui::Text("-- including the sky/HDR choice, lighting and background -- go back to their defaults.");
+    ImGui::TextDisabled("This cannot be undone with Ctrl+Z.");
+    ImGui::Separator();
+    if(ImGui::Button(ICON_MS_SETTINGS_BACKUP_RESTORE " Reset###confirmResetAll", ImVec2(120, 0)))
+    {
+      m_pendingResetSettings = true;
+      m_pendingResetLayout   = true;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if(ImGui::Button(ICON_MS_CANCEL " Cancel", ImVec2(120, 0)))
+      ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
 }
 
 void GltfRenderer::renderFileMenu(bool                   validScene,
@@ -972,7 +1000,6 @@ void GltfRenderer::renderViewMenu(bool validScene, bool& fitScene, bool& fitObje
   ImGui::MenuItem(ICON_MS_STRAIGHTEN " Snap", nullptr, &m_resources.settings.snapEnabled);
   ImGui::MenuItem(ICON_MS_MOVIE " Animation Strip", nullptr, &m_resources.animationControl.showStrip);
   ImGui::Separator();
-  ImGui::MenuItem(ICON_MS_GRID_VIEW " Grid & Snap Settings...", nullptr, &m_resources.settings.showGridSettingsWindow);
   ImGui::EndMenu();
 }
 
@@ -1008,7 +1035,43 @@ void GltfRenderer::renderWindowsMenu()
   ImGui::MenuItem(ICON_MS_GRID_VIEW " Grid & Snap", nullptr, &m_resources.settings.showGridSettingsWindow);
   ImGui::Separator();
   ImGui::MenuItem(ICON_MS_MONITORING " Memory Usage", nullptr, &m_resources.settings.showMemStats);
+  ImGui::Separator();
+  if(ImGui::MenuItem(ICON_MS_DASHBOARD " Reset UI Layout"))
+    m_pendingResetLayout = true;
+  ImGui::SetItemTooltip("Dock every panel back where a fresh run puts it. Settings are left alone.");
+  if(ImGui::MenuItem(ICON_MS_SETTINGS_BACKUP_RESTORE " Reset All to Default"))
+    m_openResetAllPopupNextFrame = true;
+  ImGui::SetItemTooltip(
+      "Put the application back in its out-of-the-box state: every setting at its default and the "
+      "default panel layout, as if starting with no ImGui.ini. The loaded scene and environment "
+      "image stay loaded, but the settings that drive them reset too.");
   ImGui::EndMenu();
+}
+
+// Consume the deferred Windows > Reset requests. Called at the top of the UI pass, so the docking
+// tree is rebuilt (and the settings are back at their defaults) before any panel is submitted this
+// frame.
+//
+// Resetting the settings writes storage directly, exactly as an ImGui.ini restore does, so the
+// same follow-up applies: replay the post-restore hooks for derived state (see settings_registry.hpp)
+// and restart accumulation. Everything else the renderers read per frame -- active renderer,
+// visualization mode, shader specialization -- is sampled from the settings each frame, so there is
+// nothing further to invalidate.
+void GltfRenderer::applyPendingResets()
+{
+  if(m_pendingResetSettings)
+  {
+    m_pendingResetSettings = false;
+    m_settings.resetToDefaults();
+    m_settings.runPostRestoreHooks();
+    resetFrame();
+    notify("Settings reset to default", false);
+  }
+  if(m_pendingResetLayout)
+  {
+    m_pendingResetLayout = false;
+    ui::resetDockLayout();
+  }
 }
 
 // (The Agentic feature has no top-level menu; its window is toggled from the
@@ -1300,17 +1363,16 @@ void GltfRenderer::renderMenu()
   if(reloadShader)
   {
     SCOPED_BANNER("Reload Shaders");
-    // SYNC NOTE: User-initiated shader recompile (Ctrl-Shift-R) — wait before destroying old pipelines.
-    vkQueueWaitIdle(m_app->getQueue(0).queue);
-    compileShaders();
-    resetFrame();
+    reloadShaders();  // owns the GPU drain and the frame reset
   }
 
   if(openFile)
   {
+    const std::filesystem::path& currentScene =
+        m_resources.getScene() ? m_resources.getScene()->getFilename() : std::filesystem::path{};
     sceneToLoadFilename = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Load 3D Scene",
                                                       "3D Scene Files|*.gltf;*.glb;*.obj;*.scene.json|glTF|*.gltf;*.glb|OBJ|*.obj|Scene Descriptor|*.scene.json",
-                                                      m_lastSceneDirectory);
+                                                      m_lastSceneDirectory, currentScene);
   }
   if(!sceneToLoadFilename.empty())
   {
@@ -1411,6 +1473,9 @@ void GltfRenderer::renderMenu()
     SCOPED_BANNER("Compact Scene");
     if(m_resources.getScene()->compactModel())
     {
+      // Compact renumbers every index-based reference (meshes, materials, textures, lights, ...),
+      // so any queued undo command holding pre-compact indices is now unsafe -- drop history.
+      m_undoStack.clear();
       // Compact rewires accessors — re-parse so render nodes / dirty flags match before GPU rebuild.
       refreshCpuSceneGraphFromModel();
       rebuildVulkanSceneFull();
@@ -1941,8 +2006,7 @@ void GltfRenderer::renderEnvironmentWindow()
   {
     if(PE::Combo("Environment Type", (int*)&m_resources.settings.envSystem, "Sky\0HDR\0None\0\0"))  // 0: Sky, 1: HDR, 2: None
     {
-      m_pathTracer.m_pushConst.fireflyClampThreshold =
-          (m_resources.settings.envSystem == shaderio::EnvSystem::eHdr) ? m_resources.hdrIbl.getIntegral() : 10.0f;
+      m_pathTracer.m_pushConst.fireflyClampThreshold = defaultFireflyClamp();
       changed |= true;
     }
     changed |= PE::Checkbox("Solid Color", &m_resources.settings.useSolidBackground);
@@ -1965,14 +2029,21 @@ void GltfRenderer::renderEnvironmentWindow()
       }
       changed |= PE::SliderFloat("Intensity", &m_resources.settings.hdrEnvIntensity, 0, 100, "%.3f",
                                  ImGuiSliderFlags_Logarithmic, "HDR intensity");
-      changed |= PE::SliderAngle("Rotation", &m_resources.settings.hdrEnvRotation, -360, 360, "%.0f deg", 0, "Rotating the environment");
+      changed |= PE::SliderFloat("Rotation", &m_resources.settings.hdrEnvRotation, -180.0F, 180.0F, "%.0f deg", 0,
+                                 "Rotating the environment");  // degrees; SliderAngle would expect radians
       changed |= PE::SliderFloat("Blur", &m_resources.settings.hdrBlur, 0, 1, "%.3f", 0, "Blur the environment");
       PE::end();
     }
   }
   else if(m_resources.settings.envSystem == shaderio::EnvSystem::eSky)
   {
-    changed |= nvgui::skyPhysicalParameterUI(m_resources.skyParams);
+    if(nvgui::skyPhysicalParameterUI(m_resources.skyParams))
+    {
+      changed = true;
+      // The sliders write sunDirection; mirror it back so skySunAzimuth/skySunElevation report
+      // what is actually on screen (and persist it) rather than the last value set by name.
+      syncSunAngles();
+    }
   }
 
   if(changed)
@@ -2086,6 +2157,9 @@ void GltfRenderer::renderStatisticsWindow()
     SCOPED_BANNER("Compact Scene");
     if(m_resources.getScene()->compactModel())
     {
+      // Compact renumbers every index-based reference; queued undo commands would restore stale
+      // indices. Mirror the Tools > Compact Scene path and drop history.
+      m_undoStack.clear();
       refreshCpuSceneGraphFromModel();
       rebuildVulkanSceneFull();
       resetFrame();  // Reset path tracer accumulation

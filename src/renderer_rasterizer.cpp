@@ -107,26 +107,32 @@ void Rasterizer::onAttach(Resources& resources, nvvk::ProfilerGpuTimer* profiler
 
 //--------------------------------------------------------------------------------------------------
 // Register command line (CLI) parameters for the Rasterizer
-void Rasterizer::registerParameters(nvutils::ParameterRegistry* paramReg)
+void Rasterizer::registerParameters(SettingsRegistry* settings)
 {
-  // Rasterizer-specific command line parameters
-  paramReg->add({"rasterUseRecordedCmd", "Rasterizer: Use recorded command buffers"}, &m_useRecordedCmd);
+  // Rasterizer-specific command line parameters.
+  //
+  // rasterUseRecordedCmd and the DLSS-SR parameters bypass the UI checkbox/settings paths that
+  // otherwise call freeRecordCommandBuffer() inline (see showUI()). A CLI or benchmark change
+  // therefore has to route the same invalidation through a callback: we set a dirty flag here
+  // and consume it at the top of onRender(), where a valid Resources& is available to schedule
+  // the deferred free. Without this, onRender() would replay a stale secondary command buffer
+  // (baked viewport / pipelines / draw order) when m_useRecordedCmd is on and twoPass is false.
+  //
+  // NOTE: ImGui.ini restore and Windows > Reset All to Default do not fire
+  // ParameterBase::callbackSuccess -- they write storage directly (see settings_registry.hpp).
+  // Any invalidation that must also cover those needs a shadow-state check in onRender(): see
+  // m_lastWireframe, and m_recordedSceneExtent for the DLSS-driven extent change.
+  const auto invalidateRecordedCmd = [this]() { m_recordedSceneCmdDirty = true; };
+  settings->add(
+      {.name            = "rasterUseRecordedCmd",
+       .help            = "Rasterizer: Use recorded command buffers",
+       .callbackSuccess = [invalidateRecordedCmd](const nvutils::ParameterBase* const) { invalidateRecordedCmd(); }},
+      &m_useRecordedCmd, Persist::eYes);
 #if defined(USE_DLSS)
-  m_dlss->registerParameters(paramReg);
+  m_dlss->registerParameters(settings, invalidateRecordedCmd);
 #endif
 }
 
-//--------------------------------------------------------------------------------------------------
-// Set the settings handler. Persists the rasterizer-only settings to the INI file under
-// names that match the command-line `--rasterUseRecordedCmd` flag.
-void Rasterizer::setSettingsHandler(nvgui::SettingsHandler* settingsHandler)
-{
-  if(settingsHandler)
-    settingsHandler->setSetting("rasterUseRecordedCmd", &m_useRecordedCmd);
-#if defined(USE_DLSS)
-  m_dlss->setSettingsHandler(settingsHandler);
-#endif
-}
 
 //--------------------------------------------------------------------------------------------------
 // Clean up rasterizer resources
@@ -163,6 +169,11 @@ void Rasterizer::onResize(VkCommandBuffer cmd, const VkExtent2D& size, Resources
   m_dlss->setOutputImage(resources.gBuffers.getColorImage(Resources::eImgRendered),
                          resources.gBuffers.getColorAttachmentView(Resources::eImgRendered),
                          resources.gBuffers.getColorFormat(Resources::eImgRendered));
+#if defined(USE_DLSSNR)
+  m_dlss->setNrImage(resources.gBuffers.getColorImage(Resources::eImgTonemapped),
+                     resources.gBuffers.getColorAttachmentView(Resources::eImgTonemapped),
+                     resources.gBuffers.getColorFormat(Resources::eImgTonemapped));
+#endif
   // Depth is owned by the inner GBuffer now -- setResources binds it directly.
   m_dlss->setResources();
 #endif
@@ -190,15 +201,29 @@ bool Rasterizer::onUIRender(Resources& resources)
   }
 
 #if defined(USE_DLSS)
-  // Mirrors PathTracer's "AI Denoisers" header so users get the same UX across the two renderers.
-  if(ImGui::CollapsingHeader("DLSS"))
+  if(ImGui::CollapsingHeader("AI Denoisers", ImGuiTreeNodeFlags_DefaultOpen))
   {
-    if(m_dlss->onUi(resources))
+    bool dlssChanged = m_dlss->onUiActivation(resources);
+#if defined(USE_DLSSNR)
+    bool nrChanged = m_dlss->onUiNrActivation();
+#endif
+
+    ImGui::Spacing();
+
+    dlssChanged |= m_dlss->onUiSettings(resources);
+    if(dlssChanged)
     {
       // Quality / preset change
       freeRecordCommandBuffer(resources);
       changed = true;
     }
+#if defined(USE_DLSSNR)
+    nrChanged |= m_dlss->onUiNrSettings();
+    changed |= nrChanged;
+#endif
+
+    ImGui::Spacing();
+    changed |= m_dlss->onUiGuideBuffers();
   }
 #endif
 
@@ -279,6 +304,16 @@ void Rasterizer::onRender(VkCommandBuffer cmd, Resources& resources)
     m_lastWireframe = resources.settings.wireframe;
   }
 
+  // Registry-driven changes (CLI, benchmark sequence) to rasterUseRecordedCmd / dlssQuality
+  // set this flag from registerParameters()'s callbacks. Drain it here, where a valid
+  // Resources& lets us submit the deferred free. Otherwise a stale secondary cmd would be
+  // replayed further down (see recordedThisFrame branch in the twoPass=false path).
+  if(m_recordedSceneCmdDirty)
+  {
+    freeRecordCommandBuffer(resources);
+    m_recordedSceneCmdDirty = false;
+  }
+
   bool dlssActive = false;
 #if defined(USE_DLSS)
   // Drive the DLSS state machine. tick() returns true ONCE on initial NGX-up or a UI-driven
@@ -289,6 +324,11 @@ void Rasterizer::onRender(VkCommandBuffer cmd, Resources& resources)
     m_dlss->setOutputImage(resources.gBuffers.getColorImage(Resources::eImgRendered),
                            resources.gBuffers.getColorAttachmentView(Resources::eImgRendered),
                            resources.gBuffers.getColorFormat(Resources::eImgRendered));
+#if defined(USE_DLSSNR)
+    m_dlss->setNrImage(resources.gBuffers.getColorImage(Resources::eImgTonemapped),
+                       resources.gBuffers.getColorAttachmentView(Resources::eImgTonemapped),
+                       resources.gBuffers.getColorFormat(Resources::eImgTonemapped));
+#endif
     m_dlss->setResources();
   }
   dlssActive = m_dlss->isActive();
@@ -341,7 +381,7 @@ void Rasterizer::onRender(VkCommandBuffer cmd, Resources& resources)
         m_lastHdrDomeView = targets.colorView;
       }
       resources.hdrDome.draw(cmd, viewMatrix, projMatrix, targets.extent, glm::vec4(resources.settings.hdrEnvIntensity),
-                             resources.settings.hdrEnvRotation, resources.settings.hdrBlur);
+                             glm::radians(resources.settings.hdrEnvRotation), resources.settings.hdrBlur);
     }
   }
 
@@ -448,6 +488,17 @@ void Rasterizer::onRender(VkCommandBuffer cmd, Resources& resources)
   renderingInfo.colorAttachmentCount = uint32_t(attachments.size());
   renderingInfo.pColorAttachments    = attachments.data();
   renderingInfo.pDepthAttachment     = &depthAttachment;
+
+  // The recording bakes viewport/scissor from the extent it was made at, so a change of active
+  // extent invalidates it. The callbacks in registerParameters() cover registry-driven edits, but
+  // not the paths that write setting storage directly -- ImGui.ini restore and Windows > Reset All
+  // to Default -- and those can turn DLSS-SR off under a live recording, moving rendering from the
+  // inner extent back to the outer one. Comparing against the recorded extent catches all of them.
+  if(m_recordedSceneCmd != VK_NULL_HANDLE
+     && (m_recordedSceneExtent.width != targets.extent.width || m_recordedSceneExtent.height != targets.extent.height))
+  {
+    freeRecordCommandBuffer(resources);
+  }
 
   if(recordedThisFrame && m_recordedSceneCmd == VK_NULL_HANDLE)
   {
@@ -654,7 +705,7 @@ void Rasterizer::createPipeline(Resources& resources)
 //--------------------------------------------------------------------------------------------------
 // Compile the rasterizer's shaders
 // Creates vertex, fragment, and wireframe shaders from the gltf_raster.slang source
-void Rasterizer::compileShader(Resources& resources, bool fromFile)
+bool Rasterizer::compileShader(Resources& resources, bool fromFile)
 {
   SCOPED_TIMER(__FUNCTION__);
 
@@ -686,6 +737,9 @@ void Rasterizer::compileShader(Resources& resources, bool fromFile)
       .pPushConstantRanges    = &pushConstantRange,
   };
 
+  // On a compile error we fall through to the embedded SPIR-V below -- the shader handles are
+  // destroyed and recreated either way, so the previous shader does not survive the failure.
+  bool compiledFromFile = false;
   if(fromFile)
   {
     resources.slangCompiler.clearMacros();
@@ -695,6 +749,7 @@ void Rasterizer::compileShader(Resources& resources, bool fromFile)
     {
       shaderInfo.codeSize = resources.slangCompiler.getSpirvSize();
       shaderInfo.pCode    = resources.slangCompiler.getSpirv();
+      compiledFromFile    = true;
     }
     else
     {
@@ -719,6 +774,8 @@ void Rasterizer::compileShader(Resources& resources, bool fromFile)
   shaderInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
   NVVK_CHECK(vkCreateShadersEXT(device, 1U, &shaderInfo, nullptr, &m_wireframeShader));
   NVVK_DBG_NAME(m_wireframeShader);
+
+  return !fromFile || compiledFromFile;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -759,6 +816,7 @@ void Rasterizer::recordRasterScene(Resources& resources, VkExtent2D renderExtent
   NVVK_CHECK(vkBeginCommandBuffer(m_recordedSceneCmd, &beginInfo));
   renderRasterScene(m_recordedSceneCmd, resources, renderExtent);
   NVVK_CHECK(vkEndCommandBuffer(m_recordedSceneCmd));
+  m_recordedSceneExtent = renderExtent;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -893,9 +951,18 @@ void Rasterizer::createOpaqueColorImage(Resources& resources)
   NVVK_CHECK(resources.allocator.createImage(m_opaqueColorImage, imageInfo, viewInfo));
   NVVK_DBG_NAME(m_opaqueColorImage.image);
 
-  // Use the existing global linear sampler for the descriptor.
-  VkSampler linearSampler{};
-  NVVK_CHECK(resources.samplerPool.acquireSampler(linearSampler));
+  // Mip-aware linear sampler: getTransmissionSample() in gltf_raster.slang selects a mip level
+  // from the material roughness, and the pool's default create info leaves maxLod at 0 -- which
+  // would clamp every fetch to mip 0 and silently make rough transmission mirror-sharp.
+  VkSampler                 linearSampler{};
+  const VkSamplerCreateInfo linearInfo{
+      .sType     = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter = VK_FILTER_LINEAR,
+      .minFilter = VK_FILTER_LINEAR,
+      .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+      .maxLod    = VK_LOD_CLAMP_NONE,
+  };
+  NVVK_CHECK(resources.samplerPool.acquireSampler(linearSampler, linearInfo));
   m_opaqueColorImage.descriptor.sampler = linearSampler;
 
   // Initial transition: UNDEFINED -> SHADER_READ_ONLY so it's safe to sample even before the
@@ -1011,10 +1078,10 @@ void Rasterizer::captureAndMipOpaqueColor(VkCommandBuffer cmd, Resources& resour
   };
   vkCmdBlitImage2(cmd, &blitInfo);
 
-  // Mip 0 is now populated; nvvk::cmdGenerateMipmaps fills levels 1..mips-1. Note that the
-  // helper uses its `currentLayout` parameter as BOTH the required input layout for all mips
-  // AND the layout it leaves them in on exit, so passing TRANSFER_DST_OPTIMAL here means a
-  // subsequent barrier is required to reach SHADER_READ_ONLY_OPTIMAL for sampling.
+  // Mip 0 is now populated; nvvk::cmdGenerateMipmaps fills levels 1..mips-1. Its `currentLayout`
+  // parameter is both the required input layout of mip 0 AND the layout all levels are left in on
+  // exit, so passing TRANSFER_DST_OPTIMAL here means a subsequent barrier is required to reach
+  // SHADER_READ_ONLY_OPTIMAL for sampling.
   if(mips > 1)
   {
     nvvk::cmdGenerateMipmaps(cmd, m_opaqueColorImage.image, {OPAQUE_COLOR_SIZE, OPAQUE_COLOR_SIZE}, mips, 1,

@@ -21,6 +21,7 @@
 
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -38,6 +39,7 @@
 #include <nvvk/ray_picker.hpp>
 #include <nvvk/resource_allocator.hpp>
 #include <nvvk/semaphore.hpp>
+#include "settings_registry.hpp"
 #include "gltf_scene.hpp"
 #include "gltf_scene_rtx.hpp"
 #include "gltf_scene_vk.hpp"
@@ -68,6 +70,24 @@
 #include "agentic.hpp"
 #endif
 
+#ifdef USE_NVMCP
+/// A clean timing series for one GPU profiler timer, gathered over a controlled window.
+/// Times are milliseconds. Compare runs on `median`; see src/mcp_timing.cpp.
+struct TimerMeasurement
+{
+  std::string timer{};
+  size_t      samples{0};
+  double      mean{0.0};
+  double      median{0.0};
+  double      standardDeviation{0.0};
+  double      minimum{0.0};
+  double      maximum{0.0};
+  std::string error{};
+
+  [[nodiscard]] static TimerMeasurement failure(std::string message) { return {.error = std::move(message)}; }
+};
+#endif
+
 class GltfRenderer : public nvapp::IAppElement
 {
 public:
@@ -77,7 +97,14 @@ public:
   /// Emits parseable BENCHMARK_ADV memory block (called from ParameterSequencer post-callback).
   void benchmarkAdvance(const nvutils::ParameterSequencer::State& state);
 
-  void createScene(const std::filesystem::path& sceneFilename);
+  /// Load a scene from disk into `m_resources.scene`. Returns true only if a new scene was
+  /// actually installed; returns false on any failure (empty path, findFile miss, OBJ parse
+  /// error, glTF load error) and leaves the current scene pointer in place. Does *not* tear
+  /// down previously-loaded derived state (sceneRtx BLAS/TLAS, sceneGpu buffers, undo stack,
+  /// thumbnails, rasterizer recorded cmd, ...): callers that replace an existing scene at
+  /// runtime must tear down first, see `loadSceneFile` and `onFileDrop`. Startup in `main.cpp`
+  /// runs before any scene exists and can call this directly.
+  bool createScene(const std::filesystem::path& sceneFilename);
   // Ensure an editable Scene exists (wired to the UI, no GPU build) so add/import can run from nothing.
   void ensureEmptyScene();
   void createSceneFromDescriptor(const std::filesystem::path& descriptorPath);
@@ -100,6 +127,28 @@ public:
 #endif
   /// Ensures path-tracer accumulation covers the full headless run (--maxFrames >= --frames).
   void alignMaxFramesForHeadless(uint32_t headlessFrames);
+
+  /// Drain the queue, recompile the active renderer's shaders, and reset accumulation.
+  /// Application thread only: it destroys and recreates live pipelines.
+  bool reloadShaders();  // false: the from-file compile failed and the embedded SPIR-V is now running
+
+  /// Mirror skyParams.sunDirection back into skySunAzimuth/skySunElevation after the sky UI moves it.
+  void syncSunAngles();
+
+  /// Load an environment map / scene by path; these back --hdrfile / --scenefile, which load on
+  /// change. False if the file does not exist or the renderer is not attached yet (the start-up
+  /// parse, where main() does the load itself). Application thread only.
+  [[nodiscard]] bool loadHdrEnvironment(const std::filesystem::path& filename);
+  [[nodiscard]] bool loadSceneFile(const std::filesystem::path& filename);
+
+#ifdef USE_NVMCP
+  /// Automation surface for the optional MCP endpoint (src/mcp_timing.cpp), which is where both
+  /// of these are defined. Thread-safe: they only read the profiler's mutex-guarded snapshots.
+  [[nodiscard]] std::vector<std::string> profilerTimerNames() const;
+  /// Blocks for `warmup + frames` rendered frames, so it must be called off the application
+  /// thread -- that is the thread producing the frames it waits on.
+  [[nodiscard]] TimerMeasurement measureTimer(const std::string& name, int warmup, int frames) const;
+#endif
 
 private:
   void onAttach(nvapp::Application* app) override;
@@ -124,7 +173,7 @@ private:
   void applyPendingSamplerUpdate();  // Consume DirtyFlags::samplers at frame top: in-place VkSampler update, no image touch
   void refreshCpuSceneGraphFromModel();
   void rebuildVulkanSceneInternal(nvvkgltf::SceneGpu::RebuildMode mode);  // GPU upload + AS; CPU scene must already be parsed
-  void compileShaders();
+  bool compileShaders();
   void createDescriptorSets();
   void createResourceBuffers();
   void createVulkanScene();
@@ -141,17 +190,18 @@ private:
   // exercised end-to-end without an actual mouse click.
   void pickSceneNodeFromScript(int nodeIndex);
   void silhouette(VkCommandBuffer cmd);
-  void tonemap(VkCommandBuffer cmd);
-  void runTonemapPass(VkCommandBuffer cmd, bool skipBeautifiedOverlay);
+  bool tonemap(VkCommandBuffer cmd);
+  bool runTonemapPass(VkCommandBuffer cmd, bool skipBeautifiedOverlay);
   void renderVisualHelpers(VkCommandBuffer cmd);
 #if defined(USE_DLSS)
   Dlss*       activeDlss();
   const Dlss* activeDlss() const;
 #endif
 
-  bool dlssGuideRequired() const;  // True when the path tracer currently needs DLSS/OptiX guide-buffer capture code.
-  void updateGizmoAttachment();
-  bool updateTextures();
+  bool  dlssGuideRequired() const;    // True when the path tracer currently needs DLSS/OptiX guide-buffer capture code.
+  float defaultFireflyClamp() const;  // Scene-appropriate firefly clamp: HDR luminance integral, else a fixed baseline.
+  void  updateGizmoAttachment();
+  bool  updateTextures();
   // Write a contiguous range of scene texture / sampler descriptors (eTextures / eSamplers). updateTextures()
   // writes the whole set; applyPendingTextureTailSync() writes only the newly appended slots.
   bool writeTextureDescriptorRange(uint32_t firstTexture, uint32_t textureCount, uint32_t firstSampler, uint32_t samplerCount);
@@ -224,6 +274,10 @@ private:
                       std::filesystem::path& sceneToMergeFilename);
   void renderViewMenu(bool validScene, bool& fitScene, bool& fitObject, bool& toggleVsync);
   void renderWindowsMenu();
+  // Windows > Reset UI Layout / Reset All to Default. Both are deferred to the top of the next UI
+  // pass (m_pendingResetLayout / m_pendingResetSettings) so the rebuild does not run while the menu
+  // bar is mid-submission, and so the panels pick the new state up before they are submitted.
+  void applyPendingResets();
   void renderEditMenu(bool validScene);
   void renderCreateMenu();  // "Create" menu: add procedural primitives (enabled whenever a scene exists)
   void renderToolsMenu(bool validScene, bool& reloadShader, bool& compactScene);
@@ -291,10 +345,17 @@ private:
   //--------------------------------------------------------------------------------------------------
   //
   //
-  nvapp::Application*                         m_app{};               // Application pointer
-  VkDevice                                    m_device{};            // Convenient
-  nvvk::RayPicker                             m_rayPicker{};         // Ray picker
-  nvutils::ProfilerTimeline*                  m_profilerTimeline{};  // Timeline profiler
+  nvapp::Application*        m_app{};               // Application pointer
+  VkDevice                   m_device{};            // Convenient
+  nvvk::RayPicker            m_rayPicker{};         // Ray picker
+  nvutils::ProfilerTimeline* m_profilerTimeline{};  // Timeline profiler
+#ifdef USE_NVMCP
+  // Guards the *lifetime* of m_profilerTimeline (not its contents, which are already mutex-guarded
+  // inside the profiler). Elements detach in registration order, so this renderer destroys the
+  // timeline while the MCP element is still serving: a worker thread can be inside a profiler read
+  // at that moment. Held for one profiler call at a time, never across a wait for a frame.
+  mutable std::mutex m_profilerTimelineMutex;
+#endif
   nvvk::ProfilerGpuTimer                      m_profilerGpuTimer{};  // GPU profiler
   std::shared_ptr<nvutils::CameraManipulator> m_cameraManip;         // Camera manipulator
 
@@ -387,8 +448,19 @@ private:
 
   VkCommandPool m_transientCmdPool{};  // Command pool for transient command buffers
 
+  SettingsRegistry                m_settings;           // Single declaration point for every setting
   nvgui::SettingsHandler          m_settingsHandler;    // Settings handler for ImGui.ini
   const nvutils::ParameterParser* m_parameterParser{};  // CLI parameter parser, for INI load filtering (see wasParsed)
+  // ImGui.ini restore runs in Application::run() *after* onAttach and writes storage directly, so
+  // it bypasses the per-setting callbackSuccess. Run any opted-in post-restore hooks once on the
+  // first frame to refresh derived state (e.g. skyParams.sunDirection from the restored
+  // skySunAzimuth/Elevation).
+  bool m_pendingRestoreCallbacks{true};
+
+  // Requested from the Windows menu, consumed by applyPendingResets() at the top of the UI pass.
+  bool m_pendingResetLayout{false};
+  bool m_pendingResetSettings{false};
+  bool m_openResetAllPopupNextFrame{false};
 
   BenchmarkController m_benchmark;
 };
